@@ -1,7 +1,3 @@
-# Zabbix Reporter v2.0 — зависимости
-# Установка: pip install -r requirements.txt
-
-openpyxl>=3.1.0       # Экспорт в Excel (.xlsx) + диаграммы
-reportlab>=4.0.0      # Экспорт в PDF
-matplotlib>=3.7.0     # Графики метрик (PDF + GUI)
-# tkinter входит в стандартный Python — устанавливать не нужно
+openpyxl>=3.1.0
+reportlab>=4.0.0
+matplotlib>=3.7.0

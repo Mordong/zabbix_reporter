@@ -1,5 +1,5 @@
 """
-Zabbix Reporter v2.0  —  Windows 10/11
+Zabbix Reporter v3.0  —  Windows 10/11
 Получение репортов из Zabbix 7.x через JSON-RPC API
 Экспорт: PDF, Excel (.xlsx), CSV
 Данные: Проблемы/Алерты, Графики метрик, Статус хостов, История событий
@@ -192,6 +192,210 @@ def dur_str(ts) -> str:
         return f"{h}h {m}m {s}s"
     except: return ""
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Сравнение шаблонов — вспомогательные функции
+# ══════════════════════════════════════════════════════════════════════════════
+import difflib as _difflib
+
+def _name_similarity(a: str, b: str) -> float:
+    return _difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def _field_diff(obj_a: dict, obj_b: dict, fields: list) -> str:
+    diffs = []
+    for f in fields:
+        va = str(obj_a.get(f, "")).strip()
+        vb = str(obj_b.get(f, "")).strip()
+        if va != vb:
+            diffs.append(f"{f}: [{va[:35]}] vs [{vb[:35]}]")
+    return "; ".join(diffs)
+
+COMPARE_FIELDS = {
+    "items":       ["key_","type","value_type","delay","units","status"],
+    "triggers":    ["expression","priority","status","recovery_mode"],
+    "drules":      ["key_","type","delay","status"],
+    "item_protos": ["key_","type","value_type","delay","units","status"],
+    "trig_protos": ["expression","priority","status","recovery_mode"],
+}
+
+def _compare_section(list_a, list_b, name_field, key_field, diff_fields,
+                     similarity_threshold=0.72):
+    rows = []
+    by_name_a = {o[name_field]: o for o in list_a}
+    by_name_b = {o[name_field]: o for o in list_b}
+    by_key_a  = {o.get(key_field,"__"): o for o in list_a if o.get(key_field)}
+    by_key_b  = {o.get(key_field,"__"): o for o in list_b if o.get(key_field)}
+    matched_a = set(); matched_b = set()
+
+    # 1. Exact name match
+    for name, oa in by_name_a.items():
+        if name in by_name_b:
+            ob = by_name_b[name]
+            diff = _field_diff(oa, ob, diff_fields)
+            rows.append(("Совпадает" if not diff else "Различия",
+                         name, name, oa.get(key_field,""), ob.get(key_field,""), diff))
+            matched_a.add(name); matched_b.add(name)
+
+    # 2. Key match
+    if key_field:
+        for key, oa in by_key_a.items():
+            if oa[name_field] in matched_a: continue
+            if key in by_key_b:
+                ob = by_key_b[key]
+                if ob[name_field] in matched_b: continue
+                diff = _field_diff(oa, ob, diff_fields)
+                rows.append(("Различия" if diff else "Совпадает",
+                             oa[name_field], ob[name_field],
+                             oa.get(key_field,""), ob.get(key_field,""),
+                             diff or "Ключи совпадают, имена различаются"))
+                matched_a.add(oa[name_field]); matched_b.add(ob[name_field])
+
+    # 3. Fuzzy name match
+    unmatched_a = [o for o in list_a if o[name_field] not in matched_a]
+    unmatched_b = [o for o in list_b if o[name_field] not in matched_b]
+    used_b = set()
+    for oa in unmatched_a:
+        best_score = 0; best_ob = None
+        for ob in unmatched_b:
+            if ob[name_field] in used_b: continue
+            score = _name_similarity(oa[name_field], ob[name_field])
+            if score > best_score:
+                best_score = score; best_ob = ob
+        if best_ob and best_score >= similarity_threshold:
+            diff = _field_diff(oa, best_ob, diff_fields)
+            key_diff = "Key различается" if oa.get(key_field,"") != best_ob.get(key_field,"") else ""
+            combined = "; ".join(filter(None, [key_diff, diff])) or f"Схожесть: {best_score:.0%}"
+            rows.append(("Похожие", oa[name_field], best_ob[name_field],
+                         oa.get(key_field,""), best_ob.get(key_field,""), combined))
+            matched_a.add(oa[name_field]); used_b.add(best_ob[name_field])
+
+    # 4/5. Only A / Only B
+    for oa in list_a:
+        if oa[name_field] not in matched_a:
+            rows.append(("Только A", oa[name_field], "",
+                         oa.get(key_field,""), "", "Отсутствует в шаблоне B"))
+    for ob in list_b:
+        if ob[name_field] not in matched_b and ob[name_field] not in used_b:
+            rows.append(("Только B", "", ob[name_field],
+                         "", ob.get(key_field,""), "Отсутствует в шаблоне A"))
+
+    order = {"Различия":0,"Похожие":1,"Только A":2,"Только B":3,"Совпадает":4}
+    rows.sort(key=lambda r: order.get(r[0], 9))
+    return rows
+
+def _compare_templates(data_a: dict, data_b: dict) -> dict:
+    return {
+        "items":       _compare_section(data_a["items"],       data_b["items"],       "name",        "key_",       COMPARE_FIELDS["items"]),
+        "triggers":    _compare_section(data_a["triggers"],    data_b["triggers"],    "description", "expression", COMPARE_FIELDS["triggers"]),
+        "drules":      _compare_section(data_a["drules"],      data_b["drules"],      "name",        "key_",       COMPARE_FIELDS["drules"]),
+        "item_protos": _compare_section(data_a["item_protos"], data_b["item_protos"], "name",        "key_",       COMPARE_FIELDS["item_protos"]),
+        "trig_protos": _compare_section(data_a["trig_protos"], data_b["trig_protos"], "description", "expression", COMPARE_FIELDS["trig_protos"]),
+    }
+
+def _compare_to_csv(folder: str, result: dict):
+    import csv, os
+    a_name = result.get("_a_name","A"); b_name = result.get("_b_name","B")
+    headers = ["Статус", f"Имя ({a_name})", f"Имя ({b_name})",
+               f"Key ({a_name})", f"Key ({b_name})", "Различия"]
+    labels = {"items":"Items","triggers":"Triggers","drules":"Discovery_Rules",
+              "item_protos":"Item_Prototypes","trig_protos":"Trigger_Prototypes"}
+    ts = datetime.date.today().isoformat()
+    for key, label in labels.items():
+        rows = result.get(key, [])
+        if not rows: continue
+        with open(os.path.join(folder, f"compare_{label}_{ts}.csv"), "w",
+                  newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerows([headers] + list(rows))
+
+def _compare_to_pdf(path: str, result: dict):
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, PageBreak, HRFlowable)
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    a_name = result.get("_a_name","Шаблон A")
+    b_name = result.get("_b_name","Шаблон B")
+    doc = SimpleDocTemplate(path, pagesize=landscape(A4),
+        topMargin=18*mm, bottomMargin=14*mm, leftMargin=12*mm, rightMargin=12*mm)
+    W = landscape(A4)[0] - 24*mm
+    ss = getSampleStyleSheet()
+    kw = {"parent": ss["Normal"], "fontName": _PDF_FONT}
+    S = {
+        "title": ParagraphStyle("CT",  **kw, fontSize=16, leading=20, fontName=_PDF_FONT_BOLD, textColor=HexColor("#0F3460")),
+        "h2":    ParagraphStyle("CH2", **kw, fontSize=11, leading=14, fontName=_PDF_FONT_BOLD, textColor=HexColor("#0F3460"), spaceBefore=8),
+        "body":  ParagraphStyle("CB",  **kw, fontSize=7,  leading=9,  textColor=HexColor("#333333"), wordWrap="CJK"),
+        "hdr":   ParagraphStyle("CHdr",**kw, fontSize=8,  leading=10, fontName=_PDF_FONT_BOLD, textColor=colors.white),
+    }
+    STC = {"Только A": HexColor("#FFCDD2"), "Только B": HexColor("#C8E6C9"),
+           "Различия": HexColor("#FFF9C4"), "Похожие":  HexColor("#FFE0B2"),
+           "Совпадает":HexColor("#F5F5F5")}
+    STX = {"Только A": HexColor("#C62828"), "Только B": HexColor("#2E7D32"),
+           "Различия": HexColor("#F57F17"), "Похожие":  HexColor("#E65100"),
+           "Совпадает":HexColor("#757575")}
+
+    st = [Paragraph("Сравнение шаблонов Zabbix", S["title"]),
+          Paragraph(f"A: {a_name}   vs   B: {b_name}", S["body"]),
+          Paragraph(f"Сформирован: {datetime.datetime.now():%Y-%m-%d %H:%M}", S["body"]),
+          HRFlowable(width=W, color=HexColor("#E94560"), thickness=2),
+          Spacer(1, 4*mm)]
+
+    # Легенда
+    legend = [("Только A","Присутствует только в A"),("Только B","Присутствует только в B"),
+              ("Различия","Одинаковое имя, но отличаются параметры"),
+              ("Похожие","Схожие имена, нечёткое совпадение"),("Совпадает","Полное совпадение")]
+    lt = Table([[Paragraph(s,S["body"]),Paragraph(d,S["body"])] for s,d in legend],
+               colWidths=[W*0.12, W*0.55])
+    lt.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.3,HexColor("#CCC")),
+                             ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
+                             ("LEFTPADDING",(0,0),(-1,-1),5)]))
+    st += [Paragraph("Легенда", S["h2"]), lt, Spacer(1, 5*mm)]
+
+    LABELS = {"items":"Items","triggers":"Triggers","drules":"Discovery Rules",
+              "item_protos":"Item Prototypes","trig_protos":"Trigger Prototypes"}
+    COL_W = [9, 22, 22, 19, 19, 29]
+
+    for key, label in LABELS.items():
+        rows = result.get(key, [])
+        diff_cnt = sum(1 for r in rows if r[0] in ("Только A","Только B","Различия","Похожие"))
+        st.append(Paragraph(f"{label}  —  всего: {len(rows)}, отличий: {diff_cnt}", S["h2"]))
+        if not rows:
+            st += [Paragraph("(нет данных)", S["body"]), Spacer(1,3*mm)]; continue
+        hdr = [Paragraph(h, S["hdr"]) for h in ("Статус","Имя A","Имя B","Key A","Key B","Различия")]
+        td = [hdr] + [[Paragraph(str(v), S["body"]) for v in r] for r in rows]
+        cw = [W*w/sum(COL_W) for w in COL_W]
+        ts_ = TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),HexColor("#0F3460")),
+            ("FONTNAME",(0,0),(-1,0),_PDF_FONT_BOLD),("FONTSIZE",(0,0),(-1,0),8),
+            ("ALIGN",(0,0),(-1,0),"CENTER"),
+            ("GRID",(0,0),(-1,-1),0.3,HexColor("#CCC")),
+            ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
+            ("LEFTPADDING",(0,0),(-1,-1),4),("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("FONTSIZE",(0,1),(-1,-1),7)])
+        for i, r in enumerate(rows):
+            if r[0] in STC: ts_.add("BACKGROUND",(0,i+1),(-1,i+1),STC[r[0]])
+            if r[0] in STX: ts_.add("TEXTCOLOR",(0,i+1),(0,i+1),STX[r[0]])
+        tbl = Table(td, colWidths=cw, repeatRows=1)
+        tbl.setStyle(ts_)
+        st += [tbl, Spacer(1,4*mm)]
+        if key != "trig_protos": st.append(PageBreak())
+
+    def _p(cv, doc):
+        cv.saveState()
+        w,h = landscape(A4)
+        cv.setFillColor(HexColor("#0F3460")); cv.rect(0,h-16*mm,w,16*mm,fill=1,stroke=0)
+        cv.setFillColor(colors.white); cv.setFont(_PDF_FONT_BOLD,10)
+        cv.drawString(12*mm,h-10*mm,"Zabbix Reporter v3.0 — Сравнение шаблонов")
+        cv.setFont(_PDF_FONT,8)
+        cv.drawRightString(w-12*mm,h-10*mm,datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        cv.setFillColor(HexColor("#0F3460")); cv.rect(0,0,w,8*mm,fill=1,stroke=0)
+        cv.setFillColor(colors.white); cv.setFont(_PDF_FONT,7)
+        cv.drawCentredString(w/2,2.5*mm,f"Страница {doc.page}")
+        cv.restoreState()
+    doc.build(st, onFirstPage=_p, onLaterPages=_p)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Zabbix JSON-RPC API клиент
@@ -454,6 +658,85 @@ class ZabbixAPI:
             "output": ["templateid","name","host"], "sortfield": "name",
         })
 
+    def get_authentication(self):
+        """Глобальные настройки аутентификации Zabbix."""
+        return self._call("authentication.get", {"output": "extend"})
+
+    def get_userdirectories(self):
+        """
+        Все LDAP/SAML user directories с полными данными,
+        включая JIT provisioning (provision_groups, provision_media).
+        Автоматически резолвит имена ролей, групп и типов медиа.
+        """
+        try:
+            dirs = self._call("userdirectory.get", {
+                "output":                "extend",
+                "selectProvisionMedia":  "extend",
+                "selectProvisionGroups": "extend",
+            })
+        except Exception as e:
+            # Zabbix < 6.4 — provisioning не поддерживается
+            if "selectProvision" in str(e) or "unexpected parameter" in str(e).lower():
+                dirs = self._call("userdirectory.get", {"output": "extend"})
+                for d in dirs:
+                    d.setdefault("provision_groups", [])
+                    d.setdefault("provision_media",  [])
+            else:
+                raise
+
+        # Собрать ID для резолвинга имён
+        role_ids = set()
+        grp_ids  = set()
+        mt_ids   = set()
+        for d in dirs:
+            for pg in d.get("provision_groups", []):
+                if pg.get("roleid"):
+                    role_ids.add(pg["roleid"])
+                for ug in pg.get("user_groups", []):
+                    if ug.get("usrgrpid"):
+                        grp_ids.add(ug["usrgrpid"])
+            for pm in d.get("provision_media", []):
+                if pm.get("mediatypeid"):
+                    mt_ids.add(pm["mediatypeid"])
+
+        role_map = {}
+        if role_ids:
+            try:
+                roles = self._call("role.get", {
+                    "output": ["roleid", "name"], "roleids": list(role_ids)})
+                role_map = {r["roleid"]: r["name"] for r in roles}
+            except Exception:
+                pass
+
+        grp_map = {}
+        if grp_ids:
+            try:
+                grps = self._call("usergroup.get", {
+                    "output": ["usrgrpid", "name"], "usrgrpids": list(grp_ids)})
+                grp_map = {g["usrgrpid"]: g["name"] for g in grps}
+            except Exception:
+                pass
+
+        mt_map = {}
+        if mt_ids:
+            try:
+                mts = self._call("mediatype.get", {
+                    "output": ["mediatypeid", "name"], "mediatypeids": list(mt_ids)})
+                mt_map = {m["mediatypeid"]: m["name"] for m in mts}
+            except Exception:
+                pass
+
+        # Встроить имена в структуру
+        for d in dirs:
+            for pg in d.get("provision_groups", []):
+                pg["_role_name"] = role_map.get(pg.get("roleid", ""), "")
+                for ug in pg.get("user_groups", []):
+                    ug["_grp_name"] = grp_map.get(ug.get("usrgrpid", ""), "")
+            for pm in d.get("provision_media", []):
+                pm["_mt_name"] = mt_map.get(pm.get("mediatypeid", ""), "")
+
+        return dirs
+
     def get_events(self, time_from, time_till, limit=1000):
         """
         Zabbix 6.0+: event.get не поддерживает selectHosts напрямую.
@@ -501,6 +784,63 @@ class ZabbixAPI:
             "sortfield": "clock", "sortorder": "ASC",
             "limit": limit,
         })
+
+    def get_template_full(self, templateid: str) -> dict:
+        """Полные данные шаблона: items, triggers, discovery rules с прототипами."""
+        # Items
+        items = self._call("item.get", {
+            "output": ["itemid","name","key_","type","value_type",
+                       "delay","units","description","status"],
+            "templateids": [templateid], "inherited": False,
+        })
+        # Triggers
+        triggers = self._call("trigger.get", {
+            "output": ["triggerid","description","expression","priority",
+                       "status","recovery_mode","recovery_expression","comments"],
+            "templateids": [templateid], "inherited": False,
+        })
+        # Discovery rules
+        drules = self._call("discoveryrule.get", {
+            "output": ["itemid","name","key_","type","delay","status","description"],
+            "templateids": [templateid], "inherited": False,
+        })
+        drule_ids = [d["itemid"] for d in drules]
+        item_protos = []
+        trig_protos = []
+        if drule_ids:
+            item_protos = self._call("itemprototype.get", {
+                "output": ["itemid","name","key_","type","value_type",
+                           "delay","units","description","status"],
+                "discoveryids": drule_ids, "inherited": False,
+            })
+            trig_protos = self._call("triggerprototype.get", {
+                "output": ["triggerid","description","expression","priority",
+                           "status","recovery_mode","recovery_expression"],
+                "discoveryids": drule_ids, "inherited": False,
+            })
+        return {
+            "items":       items,
+            "triggers":    triggers,
+            "drules":      drules,
+            "item_protos": item_protos,
+            "trig_protos": trig_protos,
+        }
+
+    def export_template_yaml(self, templateid: str) -> str:
+        """Экспортирует один шаблон в формате YAML (строка)."""
+        try:
+            return self._call("configuration.export", {
+                "format":  "yaml",
+                "options": {"templates": [templateid]},
+            })
+        except Exception as e:
+            if "yaml" in str(e).lower() or "format" in str(e).lower():
+                # Старые версии Zabbix не поддерживают yaml — fallback на XML
+                return self._call("configuration.export", {
+                    "format":  "xml",
+                    "options": {"templates": [templateid]},
+                })
+            raise
 
     def diagnose(self) -> dict:
         """Диагностика: что видит текущий пользователь через API."""
@@ -700,7 +1040,7 @@ class PDFReporter:
         canvas.rect(0, h - 22*mm, w, 22*mm, fill=1, stroke=0)
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT_BOLD, 11)
-        canvas.drawString(15*mm, h - 14*mm, "ZABBIX REPORTER v2.0")
+        canvas.drawString(15*mm, h - 14*mm, "ZABBIX REPORTER v3.0")
         canvas.setFont(_PDF_FONT, 9)
         canvas.drawRightString(w - 15*mm, h - 14*mm,
                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -709,11 +1049,11 @@ class PDFReporter:
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT, 8)
         canvas.drawCentredString(w/2, 3.5*mm,
-                                 f"Страница {doc.page}  |  Zabbix Reporter v2.0")
+                                 f"Страница {doc.page}  |  Zabbix Reporter v3.0")
         canvas.restoreState()
 
-    def build(self, problems, hosts, events, metrics=None, sections=None, hosts_detail=None):
-        if sections is None: sections = {'problems','hosts','events','metrics','hosts_detail'}
+    def build(self, problems, hosts, events, metrics=None, sections=None, hosts_detail=None, auth_data=None, user_dirs=None):
+        if sections is None: sections = {'problems','hosts','events','metrics','hosts_detail','auth'}
         doc = SimpleDocTemplate(
             self.path, pagesize=A4,
             topMargin=28*mm, bottomMargin=18*mm,
@@ -893,6 +1233,96 @@ class PDFReporter:
                 rows_hd,
                 [13, 13, 14, 16, 14, 9, 6, 14, 11]))
 
+        if 'auth' in sections and auth_data:
+            st.append(PageBreak())
+            n = _sn()
+            st += [Paragraph(f"{n}. Аутентификация и LDAP", s["ZH1"]),
+                   Spacer(1, 3*mm)]
+            # Глобальные настройки
+            AUTH_TYPE_P = {"0": "Internal", "1": "LDAP", "2": "HTTP"}
+            YESNO_P = lambda v: "Да" if str(v)=="1" else "Нет"
+            at = auth_data.get("authentication_type","0")
+            global_rows = [
+                ["Default authentication", AUTH_TYPE_P.get(at, at)],
+                ["LDAP JIT provisioning",  YESNO_P(auth_data.get("ldap_jit_status","0"))],
+                ["JIT provision interval", auth_data.get("jit_provision_interval","—")],
+                ["LDAP case sensitive",    YESNO_P(auth_data.get("ldap_case_sensitive","1"))],
+                ["HTTP auth enabled",      YESNO_P(auth_data.get("http_auth_enabled","0"))],
+                ["SAML auth enabled",      YESNO_P(auth_data.get("saml_auth_enabled","0"))],
+                ["MFA enabled",            YESNO_P(auth_data.get("mfa_status","0"))],
+                ["Password min length",    auth_data.get("passwd_min_length","8")],
+            ]
+            st += [Paragraph("Глобальные настройки", s["ZH2"]),
+                   self._table(["Параметр","Значение"], global_rows, [55, 35]),
+                   Spacer(1, 5*mm)]
+            # LDAP / SAML серверы
+            IDP_P = {"1":"LDAP","2":"SAML"}
+            for d in (user_dirs or []):
+                idp = IDP_P.get(str(d.get("idp_type","1")),"?")
+                name = d.get("name","") or f"[{idp}]"
+                st += [Paragraph(f"{idp}: {name}", s["ZH2"]), Spacer(1,2*mm)]
+                srv_rows = []
+                if d.get("idp_type","1") == "1":  # LDAP
+                    srv_rows += [
+                        ["Host",             d.get("host","")],
+                        ["Port",             d.get("port","")],
+                        ["Base DN",          d.get("base_dn","")],
+                        ["Bind DN",          d.get("bind_dn","") or "(anonymous)"],
+                        ["Bind password",    "***" if d.get("bind_password","") else "(не задан)"],
+                        ["StartTLS",         YESNO_P(d.get("start_tls","0"))],
+                        ["Search attribute", d.get("search_attribute","")],
+                        ["JIT Provisioning", "Включён" if d.get("provision_status","0")=="1" else "Отключён"],
+                    ]
+                    if d.get("provision_status","0") == "1":
+                        gc = {"1":"memberOf","2":"groupOfNames"}.get(str(d.get("group_configuration","1")),"?")
+                        srv_rows += [
+                            ["Group configuration",  gc],
+                            ["Group base DN",        d.get("group_base_dn","") or "—"],
+                            ["Group name attr",      d.get("group_name","") or "—"],
+                            ["Group member attr",    d.get("group_member","") or "—"],
+                            ["User username attr",   d.get("user_username","") or "—"],
+                            ["User lastname attr",   d.get("user_lastname","") or "—"],
+                        ]
+                else:  # SAML
+                    srv_rows += [
+                        ["IDP Entity ID",   d.get("idp_entityid","")],
+                        ["SSO URL",         d.get("sso_url","")],
+                        ["Username attr",   d.get("username_attribute","")],
+                        ["SP Entity ID",    d.get("sp_entityid","")],
+                        ["SCIM enabled",    YESNO_P(d.get("scim_status","0"))],
+                        ["JIT Provisioning","Включён" if d.get("provision_status","0")=="1" else "Отключён"],
+                    ]
+                if srv_rows:
+                    st.append(self._table(["Параметр","Значение"], srv_rows, [45, 45]))
+                # Group mappings
+                pgs = d.get("provision_groups", [])
+                if pgs:
+                    st += [Spacer(1,3*mm), Paragraph("User Group Mapping (JIT)", s["ZH2"])]
+                    pg_rows = []
+                    for pg in pgs:
+                        role = pg.get("_role_name","") or pg.get("roleid","?")
+                        grps = ", ".join(ug.get("_grp_name","") or ug.get("usrgrpid","?")
+                                         for ug in pg.get("user_groups",[]))
+                        pg_rows.append([pg.get("name","*"), role, grps])
+                    st.append(self._table(
+                        ["LDAP group pattern","Role","Zabbix groups"],
+                        pg_rows, [30, 20, 40]))
+                # Media mappings
+                pms = d.get("provision_media", [])
+                if pms:
+                    st += [Spacer(1,3*mm), Paragraph("Media Type Mapping (JIT)", s["ZH2"])]
+                    pm_rows = []
+                    for pm in pms:
+                        mt = pm.get("_mt_name","") or pm.get("mediatypeid","?")
+                        pm_rows.append([pm.get("name",""), mt,
+                                        pm.get("attribute",""),
+                                        YESNO_P(pm.get("active","1")),
+                                        pm.get("period","1-7,00:00-24:00")])
+                    st.append(self._table(
+                        ["Имя","Media type","Атрибут LDAP","Активно","Период"],
+                        pm_rows, [18, 18, 22, 10, 22]))
+                st.append(Spacer(1, 6*mm))
+
         if 'metrics' in sections and metrics:
             st.append(PageBreak())
             n = _sn()
@@ -955,9 +1385,10 @@ class ExcelReporter:
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
 
-    def build(self, problems, hosts, events, metrics=None, sections=None, hosts_detail=None):
-        if sections is None: sections = {'problems','hosts','events','metrics','hosts_detail'}
+    def build(self, problems, hosts, events, metrics=None, sections=None, hosts_detail=None, auth_data=None, user_dirs=None):
+        if sections is None: sections = {'problems','hosts','events','metrics','hosts_detail','auth'}
         if hosts_detail is None: hosts_detail = []
+        if user_dirs    is None: user_dirs    = []
         # ── Сводка ───────────────────────────────────────────────────────────
         ws0 = self.wb.active; ws0.title = "Сводка"
         ws0.sheet_view.showGridLines = False
@@ -1093,6 +1524,122 @@ class ExcelReporter:
                  "Tags","Macros"],
                 hd_rows,
                 [24,24,32,36,40,20,10,24,32,36])
+
+        # ── Аутентификация ────────────────────────────────────────────────────
+        if 'auth' in sections and auth_data:
+            YESNO_XL = lambda v: "Да" if str(v)=="1" else "Нет"
+            AUTH_TYPE_XL = {"0":"Internal","1":"LDAP","2":"HTTP"}
+            IDP_XL = {"1":"LDAP","2":"SAML"}
+
+            # Лист: глобальные настройки
+            ws_auth = self.wb.create_sheet("Аутентификация")
+            at = auth_data.get("authentication_type","0")
+            auth_global_rows = [
+                ("Default authentication", AUTH_TYPE_XL.get(at,at)),
+                ("LDAP JIT provisioning",  YESNO_XL(auth_data.get("ldap_jit_status","0"))),
+                ("JIT provision interval", auth_data.get("jit_provision_interval","—")),
+                ("LDAP case sensitive",    YESNO_XL(auth_data.get("ldap_case_sensitive","1"))),
+                ("HTTP auth enabled",      YESNO_XL(auth_data.get("http_auth_enabled","0"))),
+                ("HTTP strip domains",     auth_data.get("http_strip_domains","") or "—"),
+                ("HTTP case sensitive",    YESNO_XL(auth_data.get("http_case_sensitive","1"))),
+                ("SAML auth enabled",      YESNO_XL(auth_data.get("saml_auth_enabled","0"))),
+                ("SAML JIT status",        YESNO_XL(auth_data.get("saml_jit_status","0"))),
+                ("SAML case sensitive",    YESNO_XL(auth_data.get("saml_case_sensitive","0"))),
+                ("MFA enabled",            YESNO_XL(auth_data.get("mfa_status","0"))),
+                ("Password min length",    auth_data.get("passwd_min_length","8")),
+                ("Password check rules",   auth_data.get("passwd_check_rules","0")),
+            ]
+            self._sheet(ws_auth, ["Параметр","Значение"], auth_global_rows, [36,24])
+
+            # Лист: LDAP серверы (детали)
+            for d in user_dirs:
+                idp = IDP_XL.get(str(d.get("idp_type","1")),"?")
+                safe_name = (d.get("name","") or idp)[:24].replace("/","-")
+                ws_ud = self.wb.create_sheet(f"{idp}:{safe_name}"[:31])
+
+                # Основные поля
+                ud_rows = []
+                if d.get("idp_type","1") == "1":
+                    ud_rows = [
+                        ("Name",             d.get("name","")),
+                        ("Host",             d.get("host","")),
+                        ("Port",             d.get("port","")),
+                        ("Base DN",          d.get("base_dn","")),
+                        ("Bind DN",          d.get("bind_dn","") or "(anonymous)"),
+                        ("Bind password",    "***" if d.get("bind_password","") else "(не задан)"),
+                        ("StartTLS",         YESNO_XL(d.get("start_tls","0"))),
+                        ("Search attribute", d.get("search_attribute","")),
+                        ("JIT Provisioning", "Включён" if d.get("provision_status","0")=="1" else "Отключён"),
+                        ("Group configuration",
+                         {"1":"memberOf","2":"groupOfNames"}.get(str(d.get("group_configuration","1")),"?")),
+                        ("Group base DN",        d.get("group_base_dn","") or "—"),
+                        ("Group name attr",      d.get("group_name","") or "—"),
+                        ("Group member attr",    d.get("group_member","") or "—"),
+                        ("User username attr",   d.get("user_username","") or "—"),
+                        ("User lastname attr",   d.get("user_lastname","") or "—"),
+                        ("User ref attr",        d.get("user_ref_attr","") or "—"),
+                        ("Group filter",         d.get("group_filter","") or "—"),
+                        ("Description",          d.get("description","") or "—"),
+                    ]
+                else:
+                    ud_rows = [
+                        ("Name",               d.get("name","")),
+                        ("IDP Entity ID",      d.get("idp_entityid","")),
+                        ("SSO URL",            d.get("sso_url","")),
+                        ("SLO URL",            d.get("slo_url","") or "—"),
+                        ("Username attribute", d.get("username_attribute","")),
+                        ("SP Entity ID",       d.get("sp_entityid","")),
+                        ("NameID format",      d.get("nameid_format","") or "—"),
+                        ("SCIM enabled",       YESNO_XL(d.get("scim_status","0"))),
+                        ("JIT Provisioning",   "Включён" if d.get("provision_status","0")=="1" else "Отключён"),
+                        ("Sign messages",          YESNO_XL(d.get("sign_messages","0"))),
+                        ("Sign assertions",        YESNO_XL(d.get("sign_assertions","0"))),
+                        ("Sign authn requests",    YESNO_XL(d.get("sign_authn_requests","0"))),
+                        ("Sign logout requests",   YESNO_XL(d.get("sign_logout_requests","0"))),
+                        ("Sign logout responses",  YESNO_XL(d.get("sign_logout_responses","0"))),
+                        ("Encrypt NameID",         YESNO_XL(d.get("encrypt_nameid","0"))),
+                        ("Encrypt assertions",     YESNO_XL(d.get("encrypt_assertions","0"))),
+                        ("Group name attr",        d.get("group_name","") or "—"),
+                        ("User username attr",     d.get("user_username","") or "—"),
+                        ("User lastname attr",     d.get("user_lastname","") or "—"),
+                        ("Description",            d.get("description","") or "—"),
+                    ]
+                self._sheet(ws_ud, ["Параметр","Значение"], ud_rows, [36,40])
+
+                # Лист Group mappings
+                pgs = d.get("provision_groups", [])
+                if pgs:
+                    safe2 = safe_name[:20]
+                    ws_pg = self.wb.create_sheet(f"{idp}:{safe2} Groups"[:31])
+                    pg_rows = []
+                    for pg in pgs:
+                        role = pg.get("_role_name","") or pg.get("roleid","?")
+                        for ug in pg.get("user_groups", []):
+                            grp = ug.get("_grp_name","") or ug.get("usrgrpid","?")
+                            pg_rows.append((pg.get("name","*"), role, grp))
+                    if pg_rows:
+                        self._sheet(ws_pg,
+                            ["LDAP group pattern","Zabbix role","Zabbix user group"],
+                            pg_rows, [36,24,24])
+
+                # Лист Media mappings
+                pms = d.get("provision_media", [])
+                if pms:
+                    safe3 = safe_name[:20]
+                    ws_pm = self.wb.create_sheet(f"{idp}:{safe3} Media"[:31])
+                    pm_rows = []
+                    for pm in pms:
+                        mt = pm.get("_mt_name","") or pm.get("mediatypeid","?")
+                        pm_rows.append((
+                            pm.get("name",""), mt,
+                            pm.get("attribute",""),
+                            YESNO_XL(pm.get("active","1")),
+                            pm.get("severity",""),
+                            pm.get("period",""),
+                        ))
+                    self._sheet(ws_pm,
+                        ["Имя","Media type","Атрибут","Активно","Severity","Период"],
+                        pm_rows, [22,22,28,10,12,22])
 
         # ── Метрики ───────────────────────────────────────────────────────────
         if 'metrics' in sections and metrics and MPL_OK:
@@ -1313,7 +1860,7 @@ class LogWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("⚡ Zabbix Reporter v2.0")
+        self.title("⚡ Zabbix Reporter v3.0")
         self.geometry("1300x840")
         self.minsize(980, 660)
         self.configure(bg="#1e1e2e")
@@ -1325,6 +1872,8 @@ class App(tk.Tk):
         self._metrics      = {}
         self._items_cache  = []
         self._hosts_detail = []   # расширенные данные вкладки «Объекты»
+        self._auth_data    = {}   # authentication.get
+        self._user_dirs    = []   # userdirectory.get
         self._log_win      = None   # окно лога (Toplevel)
 
         self._cfg = _cfg_load()
@@ -1373,7 +1922,7 @@ class App(tk.Tk):
     def _build_ui(self):
         hdr = tk.Frame(self, bg="#181825", height=52)
         hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="⚡ Zabbix Reporter  v2.0",
+        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.0",
                  bg="#181825", fg="#89b4fa",
                  font=("Segoe UI",17,"bold")).pack(side="left", padx=18, pady=10)
         self._lbl_ver  = tk.Label(hdr, text="", bg="#181825",
@@ -1694,6 +2243,741 @@ class App(tk.Tk):
         self._obj_detail.tag_configure("bad", foreground="#f38ba8")
         self._obj_detail.tag_configure("dim", foreground="#6c7086")
 
+
+    # ── Вкладка «Аутентификация» ──────────────────────────────────────────────
+    def _build_auth_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        # ── Toolbar ───────────────────────────────────────────────────────────
+        tb = tk.Frame(parent, bg="#252535", pady=4)
+        tb.pack(fill="x", padx=4, pady=(4,0))
+        ttk.Button(tb, text="🔄 Загрузить",
+                   command=self._auth_load).pack(side="left", padx=6)
+        self._auth_status_lbl = tk.Label(
+            tb, text="Нажмите «Загрузить» для получения данных",
+            bg="#252535", fg="#6c7086", font=("Segoe UI",9))
+        self._auth_status_lbl.pack(side="left", padx=8)
+
+        # ── Paned: слева — список LDAP-серверов, справа — детали ─────────────
+        paned = tk.PanedWindow(parent, orient="horizontal",
+                               bg=BG, sashwidth=5, sashrelief="flat")
+        paned.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Левая часть — дерево LDAP-серверов
+        left = tk.Frame(paned, bg=BG)
+        paned.add(left, minsize=220)
+
+        tk.Label(left, text="LDAP / SAML серверы",
+                 bg=BG, fg=ACC,
+                 font=("Segoe UI",9,"bold")).pack(anchor="w", padx=6, pady=(4,2))
+
+        cols_ud = ("Имя", "Тип", "JIT")
+        self._tree_ud = ttk.Treeview(left, columns=cols_ud,
+                                      show="headings", selectmode="browse")
+        for col, w in zip(cols_ud, (140, 60, 40)):
+            self._tree_ud.heading(col, text=col)
+            self._tree_ud.column(col, width=w, minwidth=30)
+        vs_ud = ttk.Scrollbar(left, orient="vertical", command=self._tree_ud.yview)
+        self._tree_ud.configure(yscrollcommand=vs_ud.set)
+        self._tree_ud.pack(side="left", fill="both", expand=True)
+        vs_ud.pack(side="right", fill="y")
+        self._tree_ud.bind("<<TreeviewSelect>>", self._auth_on_select)
+
+        # Правая часть — детальный просмотр
+        right = tk.Frame(paned, bg=BG2)
+        paned.add(right, minsize=420)
+
+        tk.Label(right, text="  Детали конфигурации",
+                 bg=BG2, fg=ACC,
+                 font=("Segoe UI",10,"bold")).pack(fill="x", pady=(8,2))
+        ttk.Separator(right).pack(fill="x")
+
+        self._auth_detail = tk.Text(
+            right, bg=BG2, fg=FG, font=("Consolas",9),
+            relief="flat", state="disabled", wrap="word",
+            padx=12, pady=8, selectbackground="#313244")
+        auth_sb = ttk.Scrollbar(right, command=self._auth_detail.yview)
+        self._auth_detail.configure(yscrollcommand=auth_sb.set)
+        self._auth_detail.pack(side="left", fill="both", expand=True)
+        auth_sb.pack(side="right", fill="y")
+
+        # Стили текста карточки
+        self._auth_detail.tag_configure("hdr",
+            foreground=ACC, font=("Segoe UI",10,"bold"))
+        self._auth_detail.tag_configure("subhdr",
+            foreground="#cba6f7", font=("Segoe UI",9,"bold"))
+        self._auth_detail.tag_configure("key",
+            foreground="#cba6f7", font=("Consolas",9,"bold"))
+        self._auth_detail.tag_configure("val",
+            foreground=FG,  font=("Consolas",9))
+        self._auth_detail.tag_configure("ok",  foreground="#a6e3a1")
+        self._auth_detail.tag_configure("bad", foreground="#f38ba8")
+        self._auth_detail.tag_configure("dim", foreground="#6c7086")
+        self._auth_detail.tag_configure("warn",foreground="#f9e2af")
+
+    # ── Загрузка данных аутентификации ────────────────────────────────────────
+    def _auth_load(self):
+        if not self.zapi:
+            messagebox.showwarning("", "Сначала подключитесь"); return
+        self._busy(True)
+        self._auth_status_lbl.configure(text="Загрузка...")
+        def _w():
+            try:
+                auth = self.zapi.get_authentication()
+                dirs = self.zapi.get_userdirectories()
+                self.after(0, lambda: self._auth_populate(auth, dirs))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._auth_status_lbl.configure(text=f"Ошибка: {m}"),
+                    self.log(f"  [Auth] Ошибка: {m}", "err")))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _auth_populate(self, auth, dirs):
+        self._auth_data  = auth
+        self._user_dirs  = dirs
+        # Заполнить дерево
+        t = self._tree_ud
+        t.delete(*t.get_children())
+        IDP = {"1": "LDAP", "2": "SAML"}
+        for d in dirs:
+            idp  = IDP.get(str(d.get("idp_type","1")), "?")
+            jit  = "Да" if d.get("provision_status","0") == "1" else "—"
+            name = d.get("name","") or f"[{idp}]"
+            t.insert("","end", values=(name, idp, jit), iid=d["userdirectoryid"])
+        # Показать глобальные настройки сразу
+        self._auth_show_global(auth, dirs)
+        self._busy(False)
+        ldap_cnt = sum(1 for d in dirs if d.get("idp_type","1") == "1")
+        saml_cnt = sum(1 for d in dirs if d.get("idp_type","1") == "2")
+        self._auth_status_lbl.configure(
+            text=f"Загружено: {ldap_cnt} LDAP, {saml_cnt} SAML серверов")
+        self.log(f"  [Auth] LDAP={ldap_cnt} SAML={saml_cnt}", "ok")
+
+    def _auth_on_select(self, event=None):
+        sel = self._tree_ud.selection()
+        if not sel: return
+        ud_id = sel[0]
+        d = next((x for x in self._user_dirs
+                   if x["userdirectoryid"] == ud_id), None)
+        if d:
+            self._auth_show_directory(d)
+
+    def _auth_show_global(self, auth, dirs):
+        """Показывает глобальные настройки аутентификации."""
+        txt = self._auth_detail
+        txt.configure(state="normal"); txt.delete("1.0","end")
+
+        AUTH_TYPE = {"0": "Internal", "1": "LDAP", "2": "HTTP"}
+        YESNO = lambda v: ("Да" if str(v)=="1" else "Нет")
+
+        def sec(title): txt.insert("end", f"\n● {title}\n", "hdr")
+        def row(key, val, tag="val"):
+            txt.insert("end", f"  {key:<32}", "key")
+            txt.insert("end", f"{val}\n", tag)
+
+        sec("Глобальные настройки аутентификации")
+        at = auth.get("authentication_type","0")
+        row("Default authentication",
+            AUTH_TYPE.get(at, at),
+            "ok" if at=="0" else "warn")
+        row("JIT provision interval",    auth.get("jit_provision_interval","—"))
+        row("LDAP JIT provisioning",     YESNO(auth.get("ldap_jit_status","0")))
+        row("LDAP case sensitive",       YESNO(auth.get("ldap_case_sensitive","1")))
+
+        sec("Парольная политика (Internal)")
+        row("Min password length",       auth.get("passwd_min_length","—"))
+        rules = int(auth.get("passwd_check_rules","0"))
+        rule_labels = [
+            (1,  "Содержит заглавные буквы"),
+            (2,  "Содержит строчные буквы"),
+            (4,  "Содержит цифры"),
+            (8,  "Содержит спецсимволы"),
+        ]
+        for bit, label in rule_labels:
+            row(f"  {label}", "Да" if (rules & bit) else "Нет",
+                "ok" if (rules & bit) else "dim")
+
+        sec("HTTP аутентификация")
+        row("HTTP auth enabled",  YESNO(auth.get("http_auth_enabled","0")))
+        row("HTTP case sensitive",YESNO(auth.get("http_case_sensitive","1")))
+        row("HTTP strip domains", auth.get("http_strip_domains","") or "—")
+
+        sec("SAML")
+        row("SAML auth enabled",  YESNO(auth.get("saml_auth_enabled","0")))
+        row("SAML JIT status",    YESNO(auth.get("saml_jit_status","0")))
+        row("SAML case sensitive",YESNO(auth.get("saml_case_sensitive","0")))
+
+        sec("MFA")
+        row("MFA enabled", YESNO(auth.get("mfa_status","0")))
+
+        if dirs:
+            sec("LDAP / SAML серверы")
+            txt.insert("end",
+                "  Выберите сервер в списке слева для просмотра деталей\n","dim")
+
+        txt.configure(state="disabled")
+
+    def _auth_show_directory(self, d):
+        """Полная карточка одного LDAP/SAML user directory."""
+        txt = self._auth_detail
+        txt.configure(state="normal"); txt.delete("1.0","end")
+
+        IDP  = {"1": "LDAP", "2": "SAML"}
+        YESNO = lambda v: ("Да" if str(v) in ("1","true","True") else "Нет")
+        idp_type = str(d.get("idp_type","1"))
+
+        def sec(title):
+            txt.insert("end", f"\n● {title}\n", "hdr")
+        def subsec(title):
+            txt.insert("end", f"\n  ▸ {title}\n", "subhdr")
+        def row(key, val, tag="val"):
+            txt.insert("end", f"  {key:<34}", "key")
+            txt.insert("end", f"{val}\n", tag)
+
+        # ── Основное ──────────────────────────────────────────────────────────
+        sec(f"{IDP.get(idp_type,'?')} сервер: {d.get('name','') or '(без имени)'}")
+        row("ID",              d.get("userdirectoryid",""))
+        row("Описание",        d.get("description","") or "—")
+        row("JIT Provisioning",
+            "Включён" if d.get("provision_status","0")=="1" else "Отключён",
+            "ok" if d.get("provision_status","0")=="1" else "dim")
+
+        if idp_type == "1":   # ── LDAP ───────────────────────────────────────
+            sec("Подключение к LDAP серверу")
+            row("Host",          d.get("host",""))
+            row("Port",          d.get("port","389"))
+            row("Base DN",       d.get("base_dn",""))
+            row("Bind DN",       d.get("bind_dn","") or "(anonymous)")
+            row("Bind password", "***" if d.get("bind_password","") else "(не задан)")
+            row("StartTLS",      YESNO(d.get("start_tls","0")))
+
+            sec("Поиск пользователей")
+            row("Search attribute",  d.get("search_attribute",""))
+
+            if d.get("provision_status","0") == "1":
+                sec("JIT Provisioning — настройки")
+                row("Group configuration",
+                    {"1":"memberOf","2":"groupOfNames"}.get(
+                        str(d.get("group_configuration","1")), "?"))
+                row("Group base DN",        d.get("group_base_dn","") or "—")
+                row("Group name attr",      d.get("group_name","") or "—")
+                row("Group member attr",    d.get("group_member","") or "—")
+                row("User username attr",   d.get("user_username","") or "—")
+                row("User lastname attr",   d.get("user_lastname","") or "—")
+                row("User ref attr",        d.get("user_ref_attr","") or "—")
+                row("Group filter",         d.get("group_filter","") or "—")
+
+                # ── Group mappings ─────────────────────────────────────────────
+                subsec("User Group Mapping (provision_groups)")
+                pgs = d.get("provision_groups", [])
+                if pgs:
+                    for i, pg in enumerate(pgs, 1):
+                        txt.insert("end", f"\n    [{i}] LDAP pattern: ", "key")
+                        txt.insert("end", f"{pg.get('name','*')}\n", "val")
+                        role_name = pg.get("_role_name","") or pg.get("roleid","?")
+                        txt.insert("end", f"        Role:          ", "key")
+                        txt.insert("end", f"{role_name}\n", "val")
+                        ugs = pg.get("user_groups", [])
+                        if ugs:
+                            txt.insert("end", f"        Zabbix groups: ", "key")
+                            grp_names = [ug.get("_grp_name","") or ug.get("usrgrpid","?")
+                                         for ug in ugs]
+                            txt.insert("end", f"{', '.join(grp_names)}\n", "val")
+                else:
+                    txt.insert("end", "    (нет маппингов)\n", "dim")
+
+                # ── Media type mappings ────────────────────────────────────────
+                subsec("Media Type Mapping (provision_media)")
+                pms = d.get("provision_media", [])
+                if pms:
+                    for i, pm in enumerate(pms, 1):
+                        mt_name = pm.get("_mt_name","") or pm.get("mediatypeid","?")
+                        txt.insert("end", f"\n    [{i}] {pm.get('name','')}\n","key")
+                        row("        Media type", mt_name)
+                        row("        Attribute",  pm.get("attribute",""))
+                        row("        Active",     YESNO(pm.get("active","1")))
+                        row("        Severity",   pm.get("severity","63"))
+                        row("        Period",     pm.get("period","1-7,00:00-24:00"))
+                else:
+                    txt.insert("end", "    (нет маппингов)\n", "dim")
+
+        elif idp_type == "2":  # ── SAML ────────────────────────────────────────
+            sec("SAML настройки")
+            row("IDP Entity ID",   d.get("idp_entityid",""))
+            row("SSO URL",         d.get("sso_url",""))
+            row("SLO URL",         d.get("slo_url","") or "—")
+            row("Username attr",   d.get("username_attribute",""))
+            row("SP Entity ID",    d.get("sp_entityid",""))
+            row("NameID format",   d.get("nameid_format","") or "—")
+            row("SCIM enabled",    YESNO(d.get("scim_status","0")))
+
+            sec("Подписи и шифрование")
+            row("Sign messages",         YESNO(d.get("sign_messages","0")))
+            row("Sign assertions",       YESNO(d.get("sign_assertions","0")))
+            row("Sign authn requests",   YESNO(d.get("sign_authn_requests","0")))
+            row("Sign logout requests",  YESNO(d.get("sign_logout_requests","0")))
+            row("Sign logout responses", YESNO(d.get("sign_logout_responses","0")))
+            row("Encrypt NameID",        YESNO(d.get("encrypt_nameid","0")))
+            row("Encrypt assertions",    YESNO(d.get("encrypt_assertions","0")))
+
+            if d.get("provision_status","0") == "1":
+                sec("JIT Provisioning")
+                row("Group name attr",  d.get("group_name","") or "—")
+                row("User username attr",d.get("user_username","") or "—")
+                row("User lastname attr",d.get("user_lastname","") or "—")
+
+                subsec("User Group Mapping")
+                pgs = d.get("provision_groups", [])
+                if pgs:
+                    for i, pg in enumerate(pgs, 1):
+                        txt.insert("end",f"\n    [{i}] Pattern: ","key")
+                        txt.insert("end",f"{pg.get('name','*')}\n","val")
+                        role_name = pg.get("_role_name","") or pg.get("roleid","?")
+                        txt.insert("end",f"        Role:     ","key")
+                        txt.insert("end",f"{role_name}\n","val")
+                        ugs = pg.get("user_groups", [])
+                        if ugs:
+                            txt.insert("end",f"        Groups:   ","key")
+                            grp_names = [ug.get("_grp_name","") or ug.get("usrgrpid","?")
+                                         for ug in ugs]
+                            txt.insert("end",f"{', '.join(grp_names)}\n","val")
+                else:
+                    txt.insert("end","    (нет маппингов)\n","dim")
+
+                subsec("Media Type Mapping")
+                pms = d.get("provision_media", [])
+                if pms:
+                    for i, pm in enumerate(pms, 1):
+                        mt_name = pm.get("_mt_name","") or pm.get("mediatypeid","?")
+                        txt.insert("end",f"\n    [{i}] {pm.get('name','')}\n","key")
+                        row("        Media type", mt_name)
+                        row("        Attribute",  pm.get("attribute",""))
+                        row("        Active",     YESNO(pm.get("active","1")))
+                else:
+                    txt.insert("end","    (нет маппингов)\n","dim")
+
+        txt.configure(state="disabled")
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Вкладка «Сравнение шаблонов»
+    # ════════════════════════════════════════════════════════════════════════
+    def _build_compare_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        # ── Toolbar: выбор двух шаблонов ─────────────────────────────────────
+        tb = tk.Frame(parent, bg="#252535", pady=6)
+        tb.pack(fill="x", padx=4, pady=(4, 0))
+
+        tk.Label(tb, text="Шаблон A:", bg="#252535", fg=FG,
+                 font=("Segoe UI",9)).grid(row=0, column=0, padx=(10,4))
+        self._cmp_a_var = tk.StringVar()
+        self._cmb_cmp_a = ttk.Combobox(tb, textvariable=self._cmp_a_var,
+                                        state="readonly", width=36)
+        self._cmb_cmp_a.grid(row=0, column=1, padx=(0,12))
+
+        tk.Label(tb, text="Шаблон B:", bg="#252535", fg=FG,
+                 font=("Segoe UI",9)).grid(row=0, column=2, padx=(0,4))
+        self._cmp_b_var = tk.StringVar()
+        self._cmb_cmp_b = ttk.Combobox(tb, textvariable=self._cmp_b_var,
+                                        state="readonly", width=36)
+        self._cmb_cmp_b.grid(row=0, column=3, padx=(0,12))
+
+        ttk.Button(tb, text="⚖ Сравнить",
+                   command=self._cmp_run).grid(row=0, column=4, padx=(0,6))
+        ttk.Button(tb, text="📄 PDF",
+                   command=self._cmp_export_pdf).grid(row=0, column=5, padx=(0,4))
+        ttk.Button(tb, text="📋 CSV",
+                   command=self._cmp_export_csv).grid(row=0, column=6, padx=(0,10))
+
+        self._cmp_status = tk.Label(tb, text="Выберите два шаблона и нажмите «Сравнить»",
+                                     bg="#252535", fg="#6c7086", font=("Segoe UI",8))
+        self._cmp_status.grid(row=1, column=0, columnspan=7, padx=10, pady=(2,0), sticky="w")
+
+        # ── Notebook с разделами результатов ─────────────────────────────────
+        self._cmp_nb = ttk.Notebook(parent)
+        self._cmp_nb.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Создаём вкладки результатов сравнения
+        self._cmp_trees = {}
+        sections = [
+            ("items",       "📊 Items"),
+            ("triggers",    "⚡ Triggers"),
+            ("drules",      "🔍 Discovery Rules"),
+            ("item_protos", "📊 Item Prototypes"),
+            ("trig_protos", "⚡ Trigger Prototypes"),
+        ]
+        for key, label in sections:
+            frm = ttk.Frame(self._cmp_nb)
+            self._cmp_nb.add(frm, text=f" {label} ")
+            cols = ("Статус", "Имя A", "Имя B", "Key A", "Key B", "Различия")
+            t = ttk.Treeview(frm, columns=cols, show="headings",
+                             selectmode="browse")
+            widths = (90, 200, 200, 200, 200, 220)
+            for col, w in zip(cols, widths):
+                t.heading(col, text=col)
+                t.column(col, width=w, minwidth=40)
+            vs = ttk.Scrollbar(frm, orient="vertical",   command=t.yview)
+            hs = ttk.Scrollbar(frm, orient="horizontal", command=t.xview)
+            t.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+            t.grid(row=0, column=0, sticky="nsew")
+            vs.grid(row=0, column=1, sticky="ns")
+            hs.grid(row=1, column=0, sticky="ew")
+            frm.rowconfigure(0, weight=1); frm.columnconfigure(0, weight=1)
+            # Теги цветов
+            t.tag_configure("only_a",   foreground="#f38ba8")   # красный — только в A
+            t.tag_configure("only_b",   foreground="#a6e3a1")   # зелёный — только в B
+            t.tag_configure("differ",   foreground="#f9e2af")   # жёлтый  — различия
+            t.tag_configure("similar",  foreground="#fab387")   # оранжевый — похожие
+            t.tag_configure("equal",    foreground="#6c7086")   # серый   — совпадают
+            self._cmp_trees[key] = t
+
+        self._cmp_result = {}   # последний результат для экспорта
+
+    # ── Логика сравнения ──────────────────────────────────────────────────────
+    def _cmp_run(self):
+        if not self.zapi:
+            messagebox.showwarning("", "Подключитесь к Zabbix"); return
+        a_sel = self._cmp_a_var.get()
+        b_sel = self._cmp_b_var.get()
+        if not a_sel or not b_sel:
+            messagebox.showwarning("", "Выберите оба шаблона"); return
+        if a_sel == b_sel:
+            messagebox.showwarning("", "Выберите разные шаблоны"); return
+        a_id = a_sel.split("[")[-1].rstrip("]")
+        b_id = b_sel.split("[")[-1].rstrip("]")
+        self._busy(True)
+        self._cmp_status.configure(text="Загрузка данных шаблонов...")
+
+        def _w():
+            try:
+                data_a = self.zapi.get_template_full(a_id)
+                data_b = self.zapi.get_template_full(b_id)
+                result = _compare_templates(data_a, data_b)
+                self.after(0, lambda: self._cmp_populate(result, a_sel, b_sel))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._cmp_status.configure(text=f"Ошибка: {m}"),
+                    self.log(f"  [Compare] Ошибка: {m}", "err")))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _cmp_populate(self, result, a_sel, b_sel):
+        self._cmp_result = result
+        self._cmp_result["_a_name"] = a_sel.split(" [")[0]
+        self._cmp_result["_b_name"] = b_sel.split(" [")[0]
+
+        SECTION_KEYS = {
+            "items":       "items",
+            "triggers":    "triggers",
+            "drules":      "drules",
+            "item_protos": "item_protos",
+            "trig_protos": "trig_protos",
+        }
+        totals = {}
+        for key, tree_key in SECTION_KEYS.items():
+            t = self._cmp_trees[tree_key]
+            t.delete(*t.get_children())
+            rows = result.get(key, [])
+            cnt = {"only_a": 0, "only_b": 0, "differ": 0,
+                   "similar": 0, "equal": 0}
+            for row in rows:
+                status = row[0]
+                tag = {
+                    "Только A":   "only_a",
+                    "Только B":   "only_b",
+                    "Различия":   "differ",
+                    "Похожие":    "similar",
+                    "Совпадает":  "equal",
+                }.get(status, "equal")
+                t.insert("", "end", values=row, tags=(tag,))
+                cnt[tag] = cnt.get(tag, 0) + 1
+            totals[key] = cnt
+
+        # Обновить статус
+        total_diff = sum(
+            v["only_a"] + v["only_b"] + v["differ"] + v["similar"]
+            for v in totals.values())
+        self._cmp_status.configure(
+            text=(f"A: {self._cmp_result['_a_name']}  |  "
+                  f"B: {self._cmp_result['_b_name']}  |  "
+                  f"Отличий: {total_diff}"))
+        self._busy(False)
+        self.log(f"  [Compare] Сравнение завершено, отличий: {total_diff}", "ok")
+
+    def _cmp_export_pdf(self):
+        if not self._cmp_result:
+            messagebox.showwarning("", "Сначала выполните сравнение"); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf", filetypes=[("PDF","*.pdf")],
+            initialfile=f"compare_{datetime.date.today()}.pdf")
+        if not path: return
+        self._busy(True)
+        def _w():
+            try:
+                _compare_to_pdf(path, self._cmp_result)
+                self.after(0, lambda: (self._busy(False),
+                    self._info(f"PDF: {path}"),
+                    messagebox.showinfo("Готово", f"PDF сохранён:\n{path}")))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (self._busy(False),
+                    messagebox.showerror("Ошибка", m)))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _cmp_export_csv(self):
+        if not self._cmp_result:
+            messagebox.showwarning("", "Сначала выполните сравнение"); return
+        folder = filedialog.askdirectory(title="Папка для CSV файлов")
+        if not folder: return
+        self._busy(True)
+        def _w():
+            try:
+                _compare_to_csv(folder, self._cmp_result)
+                self.after(0, lambda: (self._busy(False),
+                    self._info(f"CSV: {folder}"),
+                    messagebox.showinfo("Готово", f"CSV сохранены в:\n{folder}")))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (self._busy(False),
+                    messagebox.showerror("Ошибка", m)))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _cmp_update_template_lists(self, templates):
+        """Обновить только выпадающие списки сравнения (не трогать дерево экспорта)."""""
+        vals = [f"{t.get('name','')} [{t.get('templateid','')}]" for t in templates]
+        self._cmb_cmp_a["values"] = vals
+        self._cmb_cmp_b["values"] = vals
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Вкладка «Экспорт шаблонов»
+    # ════════════════════════════════════════════════════════════════════════
+    def _build_tpl_export_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        # Toolbar
+        tb = tk.Frame(parent, bg="#252535", pady=6)
+        tb.pack(fill="x", padx=4, pady=(4, 0))
+
+        ttk.Button(tb, text="🔄 Загрузить список",
+                   command=self._tpl_exp_load).pack(side="left", padx=6)
+        ttk.Button(tb, text="☑ Выбрать все",
+                   command=lambda: self._tpl_exp_select_all(True)).pack(side="left", padx=2)
+        ttk.Button(tb, text="☐ Снять все",
+                   command=lambda: self._tpl_exp_select_all(False)).pack(side="left", padx=2)
+
+        tk.Label(tb, text="Формат:", bg="#252535", fg=FG,
+                 font=("Segoe UI",9)).pack(side="left", padx=(12,4))
+        self._tpl_exp_fmt = tk.StringVar(value="yaml")
+        for fmt in ("yaml", "xml", "json"):
+            ttk.Radiobutton(tb, text=fmt.upper(),
+                           variable=self._tpl_exp_fmt, value=fmt).pack(side="left", padx=2)
+
+        ttk.Button(tb, text="📤 Экспортировать выбранные",
+                   command=self._tpl_exp_run).pack(side="left", padx=(16,4))
+
+        self._tpl_exp_status = tk.Label(
+            tb, text="Нажмите «Загрузить список» или перейдите в «Объекты»",
+            bg="#252535", fg="#6c7086", font=("Segoe UI",8))
+        self._tpl_exp_status.pack(side="left", padx=8)
+
+        # Список шаблонов с чекбоксами
+        list_frm = tk.Frame(parent, bg=BG)
+        list_frm.pack(fill="both", expand=True, padx=4, pady=4)
+
+        cols_exp = ("✓", "Имя шаблона", "Группы", "ID")
+        self._tree_tpl_exp = ttk.Treeview(list_frm, columns=cols_exp,
+                                           show="headings", selectmode="browse")
+        for col, w in zip(cols_exp, (30, 340, 260, 80)):
+            self._tree_tpl_exp.heading(col, text=col)
+            self._tree_tpl_exp.column(col, width=w, minwidth=20)
+        vs_te = ttk.Scrollbar(list_frm, orient="vertical",
+                               command=self._tree_tpl_exp.yview)
+        hs_te = ttk.Scrollbar(list_frm, orient="horizontal",
+                               command=self._tree_tpl_exp.xview)
+        self._tree_tpl_exp.configure(yscrollcommand=vs_te.set,
+                                      xscrollcommand=hs_te.set)
+        self._tree_tpl_exp.grid(row=0, column=0, sticky="nsew")
+        vs_te.grid(row=0, column=1, sticky="ns")
+        hs_te.grid(row=1, column=0, sticky="ew")
+        list_frm.rowconfigure(0, weight=1); list_frm.columnconfigure(0, weight=1)
+
+        # Клик по строке — переключить чекбокс
+        self._tree_tpl_exp.bind("<ButtonRelease-1>", self._tpl_exp_toggle)
+        self._tree_tpl_exp.bind("<space>", self._tpl_exp_toggle)
+        self._tpl_exp_checked = set()   # templateid выбранных
+        self._tpl_exp_all_templates = []
+
+    def _tpl_exp_load(self):
+        if not self.zapi:
+            messagebox.showwarning("", "Подключитесь к Zabbix"); return
+        self._busy(True)
+        self._tpl_exp_status.configure(text="Загрузка...")
+        self.log("  [Templates] Начало загрузки списка...", "req")
+        def _w():
+            try:
+                tpls = self._call_or_get_templates()
+                self.after(0, lambda: self._tpl_exp_refresh(tpls))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._tpl_exp_status.configure(text=f"Ошибка: {m}"),
+                    self.log(f"  [Templates] Ошибка загрузки: {m}", "err"),
+                    messagebox.showerror("Ошибка загрузки шаблонов", m)))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _call_or_get_templates(self):
+        """
+        Zabbix 6.2+: selectGroups -> selectTemplateGroups, ответ в templategroups.
+        Пробуем три варианта с фоллбэком.
+        """
+        # Попытка 1: Zabbix 6.2+ selectTemplateGroups
+        try:
+            tpls = self.zapi._call("template.get", {
+                "output":               ["templateid","name","description"],
+                "selectTemplateGroups": ["groupid","name"],
+                "sortfield":            "name",
+            })
+            for t in tpls:
+                t["groups"] = t.get("templategroups", t.get("groups", []))
+            self.log(f"  [Templates] Загружено: {len(tpls)}", "ok")
+            return tpls
+        except Exception as e1:
+            self.log(f"  [Templates] selectTemplateGroups failed: {e1}", "warn")
+
+        # Попытка 2: старый selectGroups (Zabbix < 6.2)
+        try:
+            tpls = self.zapi._call("template.get", {
+                "output":       ["templateid","name","description"],
+                "selectGroups": ["groupid","name"],
+                "sortfield":    "name",
+            })
+            for t in tpls:
+                if "groups" not in t:
+                    t["groups"] = []
+            self.log(f"  [Templates] Загружено (fallback): {len(tpls)}", "ok")
+            return tpls
+        except Exception as e2:
+            self.log(f"  [Templates] selectGroups fallback failed: {e2}", "warn")
+
+        # Попытка 3: без групп
+        tpls = self.zapi._call("template.get", {
+            "output":    ["templateid","name","description"],
+            "sortfield": "name",
+        })
+        for t in tpls:
+            t["groups"] = []
+        self.log(f"  [Templates] Загружено (без групп): {len(tpls)}", "ok")
+        return tpls
+
+    def _tpl_exp_refresh(self, templates):
+        self._tpl_exp_all_templates = templates
+        self._tpl_exp_checked = set()
+        # Заполнить дерево
+        t = self._tree_tpl_exp
+        t.delete(*t.get_children())
+        for tpl in templates:
+            grps = ", ".join(g.get("name","") for g in tpl.get("groups", []))
+            iid  = str(tpl["templateid"])          # iid всегда строка
+            t.insert("", "end",
+                     values=("☐", tpl.get("name",""), grps, iid),
+                     iid=iid)
+        cnt = len(templates)
+        status = (f"Загружено шаблонов: {cnt}"
+                  if cnt else
+                  "Шаблонов не найдено — проверьте права пользователя")
+        self._tpl_exp_status.configure(text=status)
+        self.log(f"  [Templates] {status}", "ok" if cnt else "warn")
+        self._busy(False)
+        # Обновить выпадающие списки вкладки сравнения (без рекурсии)
+        try:
+            vals = [f"{tpl.get('name','')} [{tpl.get('templateid','')}]"
+                    for tpl in templates]
+            self._cmb_cmp_a["values"] = vals
+            self._cmb_cmp_b["values"] = vals
+        except Exception:
+            pass
+
+    def _tpl_exp_toggle(self, event=None):
+        sel = self._tree_tpl_exp.selection()
+        if not sel: return
+        iid = str(sel[0])   # всегда строка
+        if iid in self._tpl_exp_checked:
+            self._tpl_exp_checked.discard(iid)
+            self._tree_tpl_exp.set(iid, "✓", "☐")
+        else:
+            self._tpl_exp_checked.add(iid)
+            self._tree_tpl_exp.set(iid, "✓", "☑")
+        n = len(self._tpl_exp_checked)
+        self._tpl_exp_status.configure(text=f"Выбрано: {n}")
+
+    def _tpl_exp_select_all(self, select: bool):
+        # Итерируем только по строкам которые реально вставлены в дерево
+        existing_iids = set(self._tree_tpl_exp.get_children())
+        self._tpl_exp_checked = set()
+        for iid in existing_iids:
+            if select:
+                self._tpl_exp_checked.add(iid)
+                self._tree_tpl_exp.set(iid, "✓", "☑")
+            else:
+                self._tree_tpl_exp.set(iid, "✓", "☐")
+        n = len(self._tpl_exp_checked)
+        self._tpl_exp_status.configure(text=f"Выбрано: {n}")
+
+    def _tpl_exp_run(self):
+        if not self.zapi:
+            messagebox.showwarning("", "Подключитесь к Zabbix"); return
+        if not self._tpl_exp_checked:
+            messagebox.showwarning("", "Выберите хотя бы один шаблон"); return
+        folder = filedialog.askdirectory(title="Папка для сохранения YAML/XML/JSON файлов")
+        if not folder: return
+        fmt = self._tpl_exp_fmt.get()
+        ids = list(self._tpl_exp_checked)   # все iid — строки
+        # Найти имена выбранных шаблонов (ключи тоже строки)
+        tpl_map = {str(t["templateid"]): t["name"] for t in self._tpl_exp_all_templates}
+        self._busy(True)
+        self._tpl_exp_status.configure(text=f"Экспорт 0/{len(ids)}...")
+
+        def _w():
+            ok = 0; errors = []
+            for i, tid in enumerate(ids, 1):
+                tname = tpl_map.get(tid, tid)
+                # Безопасное имя файла
+                safe = "".join(c if c.isalnum() or c in " _-.()" else "_"
+                               for c in tname).strip()
+                ext = {"yaml":".yaml","xml":".xml","json":".json"}.get(fmt,".yaml")
+                fpath = os.path.join(folder, f"{safe}{ext}")
+                try:
+                    content = self.zapi.export_template_yaml(tid) if fmt == "yaml" \
+                              else self.zapi._call("configuration.export", {
+                                  "format": fmt, "options": {"templates": [tid]}})
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    ok += 1
+                    self.after(0, lambda ii=i, n=len(ids):
+                        self._tpl_exp_status.configure(
+                            text=f"Экспорт {ii}/{n}..."))
+                except Exception as ex:
+                    errors.append(f"{tname}: {ex}")
+            def _done():
+                self._busy(False)
+                msg = f"Экспортировано: {ok}/{len(ids)}"
+                if errors:
+                    msg += f"\nОшибок: {len(errors)}"
+                self._tpl_exp_status.configure(text=msg)
+                if errors:
+                    messagebox.showwarning("Частичный успех",
+                        f"{msg}\n\nОшибки:\n" + "\n".join(errors[:5]))
+                else:
+                    messagebox.showinfo("Готово",
+                        f"Экспортировано {ok} шаблонов в:\n{folder}")
+            self.after(0, _done)
+        threading.Thread(target=_w, daemon=True).start()
+
     # ── Вкладки ───────────────────────────────────────────────────────────────
     def _build_tabs(self, parent):
         nb = ttk.Notebook(parent); nb.pack(fill="both", expand=True)
@@ -1718,6 +3002,15 @@ class App(tk.Tk):
 
         t6 = ttk.Frame(nb); nb.add(t6, text=" 🗂 Объекты ")
         self._build_objects_tab(t6)
+
+        t7 = ttk.Frame(nb); nb.add(t7, text=" 🔐 Аутентификация ")
+        self._build_auth_tab(t7)
+
+        t8 = ttk.Frame(nb); nb.add(t8, text=" ⚖ Сравнение ")
+        self._build_compare_tab(t8)
+
+        t9 = ttk.Frame(nb); nb.add(t9, text=" 📤 Экспорт шаблонов ")
+        self._build_tpl_export_tab(t9)
 
         t5 = ttk.Frame(nb); nb.add(t5, text=" 📊 Сводка ")
         self._sum_txt = tk.Text(t5, bg="#181825", fg="#cdd6f4",
@@ -1908,6 +3201,7 @@ class App(tk.Tk):
         self._cmb_hm["values"] = [
             f"{hh.get('host','')}  [{hh.get('hostid','')}]" for hh in h]
         if h: self._cmb_hm.current(0)
+
         self._busy(False)
         summary = f"Загружено: {len(p)} проблем | {len(h)} хостов | {len(ev)} событий"
         self._info(summary)
@@ -1996,7 +3290,7 @@ class App(tk.Tk):
         for x in p: sc[str(x.get("severity","0"))] = sc.get(str(x.get("severity","0")),0)+1
         av = {"Available":0,"Unavailable":0,"Unknown":0}
         for x in h: av[HOST_AVAIL.get(str(x.get("available","0")),"Unknown")] += 1
-        lines = ["═"*62,"  СВОДНЫЙ ОТЧЁТ — Zabbix Reporter v2.0",
+        lines = ["═"*62,"  СВОДНЫЙ ОТЧЁТ — Zabbix Reporter v3.0",
                  f"  {datetime.datetime.now():%Y-%m-%d %H:%M:%S}","═"*62,"",
                  f"  ПРОБЛЕМЫ (всего: {len(p)})", "  "+"-"*44]
         for k, n in SEVERITY_NAMES.items():
@@ -2120,7 +3414,9 @@ class App(tk.Tk):
                 PDFReporter(path).build(self._problems, self._hosts,
                                         self._events, self._metrics or None,
                                         sections=secs,
-                                        hosts_detail=self._hosts_detail or None)
+                                        hosts_detail=self._hosts_detail or None,
+                                        auth_data=self._auth_data or None,
+                                        user_dirs=self._user_dirs or None)
                 self.after(0, lambda: (self._busy(False),
                     self._info(f"PDF: {path}"),
                     messagebox.showinfo("Готово", f"PDF сохранён:\n{path}")))
@@ -2146,7 +3442,9 @@ class App(tk.Tk):
                 ExcelReporter(path).build(self._problems, self._hosts,
                                           self._events, self._metrics or None,
                                           sections=secs,
-                                          hosts_detail=self._hosts_detail or None)
+                                          hosts_detail=self._hosts_detail or None,
+                                          auth_data=self._auth_data or None,
+                                          user_dirs=self._user_dirs or None)
                 self.after(0, lambda: (self._busy(False),
                     self._info(f"Excel: {path}"),
                     messagebox.showinfo("Готово", f"Excel сохранён:\n{path}")))
@@ -2162,7 +3460,7 @@ class App(tk.Tk):
         saved = self._cfg.get("report_sections",
                                {"problems": True, "hosts": True,
                                 "events": True, "hosts_detail": True,
-                                "metrics": True})
+                                "auth": True, "metrics": True})
         BG = "#1e1e2e"; ACC = "#89b4fa"; FG = "#cdd6f4"; DIM = "#6c7086"
 
         dlg = tk.Toplevel(self)
@@ -2214,6 +3512,7 @@ class App(tk.Tk):
             ("hosts",        "🖥  Статус хостов",         "Сводная таблица хостов"),
             ("events",       "📋  История событий",       "События из вкладки «События»"),
             ("hosts_detail", "🗂  Объекты мониторинга",   "Шаблоны, интерфейсы, теги, макросы"),
+            ("auth",         "🔐  Аутентификация / LDAP", "Глобальные настройки + все LDAP/SAML серверы с JIT"),
             ("metrics",      "📈  Графики метрик",        "Загруженные графики из вкладки «Метрики»"),
         ]
         vars_ = {}
