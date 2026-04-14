@@ -103,16 +103,14 @@ except ImportError:
 
 try:
     import matplotlib
-    matplotlib.use("Agg")
+    # Do NOT call matplotlib.use("Agg") here — it breaks FigureCanvasTkAgg.
+    # The Agg backend is set only inside PDF export functions when needed.
     import matplotlib.pyplot as plt
-    MPL_OK = True
-except ImportError:
-    MPL_OK = False
-
-try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MPL_OK    = True
     MPL_TK_OK = True
 except ImportError:
+    MPL_OK    = False
     MPL_TK_OK = False
 
 
@@ -323,12 +321,14 @@ def _compare_to_pdf(path: str, result: dict):
         topMargin=18*mm, bottomMargin=14*mm, leftMargin=12*mm, rightMargin=12*mm)
     W = landscape(A4)[0] - 24*mm
     ss = getSampleStyleSheet()
-    kw = {"parent": ss["Normal"], "fontName": _PDF_FONT}
+    kw      = {"parent": ss["Normal"]}   # no fontName here — set per style
+    kw_body = {**kw, "fontName": _PDF_FONT}
+    kw_bold = {**kw, "fontName": _PDF_FONT_BOLD}
     S = {
-        "title": ParagraphStyle("CT",  **kw, fontSize=16, leading=20, fontName=_PDF_FONT_BOLD, textColor=HexColor("#0F3460")),
-        "h2":    ParagraphStyle("CH2", **kw, fontSize=11, leading=14, fontName=_PDF_FONT_BOLD, textColor=HexColor("#0F3460"), spaceBefore=8),
-        "body":  ParagraphStyle("CB",  **kw, fontSize=7,  leading=9,  textColor=HexColor("#333333"), wordWrap="CJK"),
-        "hdr":   ParagraphStyle("CHdr",**kw, fontSize=8,  leading=10, fontName=_PDF_FONT_BOLD, textColor=colors.white),
+        "title": ParagraphStyle("CT",   **kw_bold, fontSize=16, leading=20, textColor=HexColor("#0F3460")),
+        "h2":    ParagraphStyle("CH2",  **kw_bold, fontSize=11, leading=14, textColor=HexColor("#0F3460"), spaceBefore=8),
+        "body":  ParagraphStyle("CB",   **kw_body, fontSize=7,  leading=9,  textColor=HexColor("#333333"), wordWrap="CJK"),
+        "hdr":   ParagraphStyle("CHdr", **kw_bold, fontSize=8,  leading=10, textColor=colors.white),
     }
     STC = {"Только A": HexColor("#FFCDD2"), "Только B": HexColor("#C8E6C9"),
            "Различия": HexColor("#FFF9C4"), "Похожие":  HexColor("#FFE0B2"),
@@ -396,6 +396,237 @@ def _compare_to_pdf(path: str, result: dict):
         cv.drawCentredString(w/2,2.5*mm,f"Страница {doc.page}")
         cv.restoreState()
     doc.build(st, onFirstPage=_p, onLaterPages=_p)
+
+
+def _auth_to_pdf(path: str, auth_data: dict, user_dirs: list):
+    """
+    Генерирует PDF-отчёт по настройкам аутентификации Zabbix.
+    Содержит: глобальные настройки, детали каждого LDAP/SAML сервера,
+    JIT provisioning (group mapping + media type mapping).
+    """
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, PageBreak, HRFlowable)
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    doc = SimpleDocTemplate(
+        path, pagesize=A4,
+        topMargin=22*mm, bottomMargin=16*mm,
+        leftMargin=15*mm, rightMargin=15*mm)
+    W = A4[0] - 30*mm
+
+    ss = getSampleStyleSheet()
+    kw_body = {"parent": ss["Normal"], "fontName": _PDF_FONT}
+    kw_bold = {"parent": ss["Normal"], "fontName": _PDF_FONT_BOLD}
+    S = {
+        "title": ParagraphStyle("AT",   **kw_bold, fontSize=18, leading=22,
+                                textColor=HexColor("#0F3460")),
+        "h1":    ParagraphStyle("AH1",  **kw_bold, fontSize=13, leading=16,
+                                textColor=HexColor("#0F3460"), spaceBefore=10),
+        "h2":    ParagraphStyle("AH2",  **kw_bold, fontSize=10, leading=13,
+                                textColor=HexColor("#E94560"), spaceBefore=6),
+        "body":  ParagraphStyle("AB",   **kw_body, fontSize=9,  leading=12,
+                                textColor=HexColor("#333333"), wordWrap="CJK"),
+        "hdr":   ParagraphStyle("AHdr", **kw_bold, fontSize=9,  leading=11,
+                                textColor=colors.white),
+        "dim":   ParagraphStyle("ADim", **kw_body, fontSize=8,  leading=10,
+                                textColor=HexColor("#888888")),
+    }
+
+    YESNO = lambda v: "Да" if str(v) == "1" else "Нет"
+    AUTH_TYPE = {"0": "Internal", "1": "LDAP", "2": "HTTP"}
+    IDP_TYPE  = {"1": "LDAP",    "2": "SAML"}
+    GC_TYPE   = {"1": "memberOf", "2": "groupOfNames"}
+
+    def _tbl(headers, rows, weights):
+        total = sum(weights)
+        cw    = [W * w / total for w in weights]
+        hrow  = [Paragraph(h, S["hdr"]) for h in headers]
+        brows = [[Paragraph(str(v) if v is not None else "—", S["body"])
+                  for v in row] for row in rows]
+        ts = TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0), HexColor("#0F3460")),
+            ("GRID",          (0,0),(-1,-1), 0.3, HexColor("#CCCCCC")),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),
+             [HexColor("#F5F8FF"), HexColor("#FFFFFF")]),
+            ("TOPPADDING",    (0,0),(-1,-1), 4),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 4),
+            ("LEFTPADDING",   (0,0),(-1,-1), 6),
+            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+            ("FONTSIZE",      (0,1),(-1,-1), 8),
+        ])
+        t = Table([hrow]+brows, colWidths=cw, repeatRows=1)
+        t.setStyle(ts)
+        return t
+
+    # ── Сборка документа ──────────────────────────────────────────────────
+    st = []
+
+    st += [
+        Paragraph("Отчёт: Настройки аутентификации Zabbix", S["title"]),
+        Spacer(1, 2*mm),
+        Paragraph(f"Сформирован: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+                  S["dim"]),
+        HRFlowable(width=W, color=HexColor("#E94560"), thickness=2),
+        Spacer(1, 5*mm),
+    ]
+
+    # ── Глобальные настройки ──────────────────────────────────────────────
+    at = auth_data.get("authentication_type","0")
+    rules = int(auth_data.get("passwd_check_rules","0"))
+    rule_list = ", ".join(filter(None, [
+        "Заглавные" if rules & 1 else "",
+        "Строчные"  if rules & 2 else "",
+        "Цифры"     if rules & 4 else "",
+        "Спецсимволы" if rules & 8 else "",
+    ])) or "—"
+
+    glob_rows = [
+        ("Default authentication",  AUTH_TYPE.get(at, at)),
+        ("LDAP auth enabled",       YESNO(auth_data.get("ldap_auth_enabled","0"))),
+        ("LDAP JIT provisioning",   YESNO(auth_data.get("ldap_jit_status","0"))),
+        ("LDAP JIT interval",       auth_data.get("jit_provision_interval","—")),
+        ("LDAP case sensitive",     YESNO(auth_data.get("ldap_case_sensitive","1"))),
+        ("HTTP auth enabled",       YESNO(auth_data.get("http_auth_enabled","0"))),
+        ("HTTP strip domains",      auth_data.get("http_strip_domains","") or "—"),
+        ("HTTP case sensitive",     YESNO(auth_data.get("http_case_sensitive","1"))),
+        ("SAML auth enabled",       YESNO(auth_data.get("saml_auth_enabled","0"))),
+        ("SAML JIT status",         YESNO(auth_data.get("saml_jit_status","0"))),
+        ("SAML case sensitive",     YESNO(auth_data.get("saml_case_sensitive","0"))),
+        ("MFA enabled",             YESNO(auth_data.get("mfa_status","0"))),
+        ("Password min length",     auth_data.get("passwd_min_length","8")),
+        ("Password complexity",     rule_list),
+    ]
+    st += [
+        Paragraph("1. Глобальные настройки аутентификации", S["h1"]),
+        Spacer(1, 2*mm),
+        _tbl(["Параметр", "Значение"], glob_rows, [55, 35]),
+        Spacer(1, 6*mm),
+    ]
+
+    if not user_dirs:
+        st.append(Paragraph("LDAP / SAML серверы не настроены.", S["body"]))
+    else:
+        st.append(Paragraph("2. LDAP / SAML серверы", S["h1"]))
+        st.append(Spacer(1, 2*mm))
+        for idx, d in enumerate(user_dirs, 1):
+            idp  = IDP_TYPE.get(str(d.get("idp_type","1")), "?")
+            name = d.get("name","") or f"[{idp}]"
+            jit  = d.get("provision_status","0") == "1"
+            st.append(Paragraph(f"2.{idx}  {idp}: {name}", S["h2"]))
+
+            if str(d.get("idp_type","1")) == "1":  # LDAP
+                srv_rows = [
+                    ("Host",              d.get("host","")),
+                    ("Port",              d.get("port","389")),
+                    ("Base DN",           d.get("base_dn","")),
+                    ("Bind DN",           d.get("bind_dn","") or "(anonymous)"),
+                    ("Bind password",     "***" if d.get("bind_password","") else "(не задан)"),
+                    ("StartTLS",          YESNO(d.get("start_tls","0"))),
+                    ("Search attribute",  d.get("search_attribute","")),
+                    ("JIT Provisioning",  "Включён" if jit else "Отключён"),
+                ]
+                if jit:
+                    gc = GC_TYPE.get(str(d.get("group_configuration","1")),"?")
+                    srv_rows += [
+                        ("Group configuration", gc),
+                        ("Group base DN",       d.get("group_base_dn","") or "—"),
+                        ("Group name attr",     d.get("group_name","") or "—"),
+                        ("Group member attr",   d.get("group_member","") or "—"),
+                        ("User username attr",  d.get("user_username","") or "—"),
+                        ("User lastname attr",  d.get("user_lastname","") or "—"),
+                        ("User ref attr",       d.get("user_ref_attr","") or "—"),
+                        ("Group filter",        d.get("group_filter","") or "—"),
+                    ]
+            else:  # SAML
+                srv_rows = [
+                    ("IDP Entity ID",          d.get("idp_entityid","")),
+                    ("SSO URL",                d.get("sso_url","")),
+                    ("SLO URL",                d.get("slo_url","") or "—"),
+                    ("Username attribute",     d.get("username_attribute","")),
+                    ("SP Entity ID",           d.get("sp_entityid","")),
+                    ("NameID format",          d.get("nameid_format","") or "—"),
+                    ("SCIM enabled",           YESNO(d.get("scim_status","0"))),
+                    ("JIT Provisioning",       "Включён" if jit else "Отключён"),
+                    ("Sign messages",          YESNO(d.get("sign_messages","0"))),
+                    ("Sign assertions",        YESNO(d.get("sign_assertions","0"))),
+                    ("Sign authn requests",    YESNO(d.get("sign_authn_requests","0"))),
+                    ("Sign logout requests",   YESNO(d.get("sign_logout_requests","0"))),
+                    ("Sign logout responses",  YESNO(d.get("sign_logout_responses","0"))),
+                    ("Encrypt NameID",         YESNO(d.get("encrypt_nameid","0"))),
+                    ("Encrypt assertions",     YESNO(d.get("encrypt_assertions","0"))),
+                ]
+
+            if d.get("description"):
+                srv_rows.append(("Description", d["description"][:120]))
+
+            st += [
+                _tbl(["Параметр", "Значение"], srv_rows, [45, 45]),
+                Spacer(1, 3*mm),
+            ]
+
+            # JIT: Group mapping
+            pgs = d.get("provision_groups", [])
+            if pgs:
+                st.append(Paragraph("User Group Mapping (JIT)", S["h2"]))
+                pg_rows = []
+                for pg in pgs:
+                    role = pg.get("_role_name","") or pg.get("roleid","?")
+                    grps = ", ".join(
+                        ug.get("_grp_name","") or ug.get("usrgrpid","?")
+                        for ug in pg.get("user_groups",[]))
+                    pg_rows.append((pg.get("name","*"), role, grps or "—"))
+                st += [
+                    _tbl(["LDAP group pattern", "Zabbix role", "Zabbix user groups"],
+                         pg_rows, [35, 25, 30]),
+                    Spacer(1, 3*mm),
+                ]
+
+            # JIT: Media type mapping
+            pms = d.get("provision_media", [])
+            if pms:
+                st.append(Paragraph("Media Type Mapping (JIT)", S["h2"]))
+                pm_rows = []
+                for pm in pms:
+                    mt = pm.get("_mt_name","") or pm.get("mediatypeid","?")
+                    pm_rows.append((
+                        pm.get("name",""), mt,
+                        pm.get("attribute",""),
+                        YESNO(pm.get("active","1")),
+                        pm.get("period","1-7,00:00-24:00"),
+                    ))
+                st += [
+                    _tbl(["Имя", "Media type", "Атрибут LDAP", "Активно", "Период"],
+                         pm_rows, [20, 22, 26, 10, 22]),
+                    Spacer(1, 4*mm),
+                ]
+
+            if idx < len(user_dirs):
+                st.append(PageBreak())
+
+    def _on_page(canvas, doc):
+        canvas.saveState()
+        w, h = A4
+        canvas.setFillColor(HexColor("#0F3460"))
+        canvas.rect(0, h-18*mm, w, 18*mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont(_PDF_FONT_BOLD, 10)
+        canvas.drawString(15*mm, h-11*mm, "Zabbix Reporter v3.0 — Аутентификация")
+        canvas.setFont(_PDF_FONT, 8)
+        canvas.drawRightString(w-15*mm, h-11*mm,
+                               datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        canvas.setFillColor(HexColor("#0F3460"))
+        canvas.rect(0, 0, w, 9*mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont(_PDF_FONT, 7)
+        canvas.drawCentredString(w/2, 3*mm,
+                                 f"Страница {doc.page}  |  Zabbix Reporter v3.0")
+        canvas.restoreState()
+
+    doc.build(st, onFirstPage=_on_page, onLaterPages=_on_page)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Zabbix JSON-RPC API клиент
@@ -1006,7 +1237,11 @@ class PDFReporter:
 
     def _metrics_img(self, hist_data, title):
         if not MPL_OK or not hist_data: return None
-        fig, ax = plt.subplots(figsize=(7, 2.8))
+        import matplotlib
+        _prev_backend = matplotlib.get_backend()
+        matplotlib.use("Agg")   # switch to non-interactive for file render
+        import matplotlib.pyplot as _plt_pdf
+        fig, ax = _plt_pdf.subplots(figsize=(7, 2.8))
         fig.patch.set_facecolor("#F8FAFF")
         ax.set_facecolor("#F4F6FF")
         palette = ["#0F3460","#E94560","#457B9D","#2A9D8F","#E9C46A"]
@@ -1028,7 +1263,11 @@ class PDFReporter:
             ax.legend(fontsize=7, framealpha=0.5)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
-        plt.close(fig)
+        _plt_pdf.close(fig)
+        try:
+            matplotlib.use(_prev_backend)
+        except Exception:
+            pass
         buf.seek(0)
         return RLImage(buf, width=16*cm, height=6.5*cm)
 
@@ -1861,8 +2100,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("⚡ Zabbix Reporter v3.0")
-        self.geometry("1300x840")
-        self.minsize(980, 660)
+        self.geometry("1540x860")
+        self.minsize(1200, 700)
         self.configure(bg="#1e1e2e")
 
         self.zapi          = None
@@ -1900,7 +2139,7 @@ class App(tk.Tk):
               foreground=[("disabled","#6c7086")])
         s.configure("TNotebook",    background=BG, tabmargins=[2,2,2,0])
         s.configure("TNotebook.Tab",background=SEL, foreground=FG,
-                     padding=[14,6], font=("Segoe UI",10))
+                     padding=[7,5], font=("Segoe UI",9))
         s.map("TNotebook.Tab",
               background=[("selected",ACC)], foreground=[("selected","#1e1e2e")])
         s.configure("Treeview",     background=ENT, foreground=FG,
@@ -1909,8 +2148,24 @@ class App(tk.Tk):
                      font=("Segoe UI",9,"bold"))
         s.map("Treeview",
               background=[("selected",ACC)], foreground=[("selected","#1e1e2e")])
-        s.configure("TEntry",       fieldbackground=ENT, foreground=FG)
-        s.configure("TCombobox",    fieldbackground=ENT, foreground=FG)
+        s.configure("TEntry",    fieldbackground=ENT, foreground=FG,
+                     insertcolor=FG, selectbackground=ACC, selectforeground="#1e1e2e")
+        # Combobox: явно задаём все состояния чтобы текст не сливался с фоном
+        s.configure("TCombobox",
+                     fieldbackground=ENT, foreground=FG, background=ENT,
+                     selectbackground=ENT, selectforeground=FG,
+                     insertcolor=FG, arrowcolor=ACC)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", ENT), ("disabled", BG),
+                               ("focus",    ENT), ("!focus",   ENT)],
+              foreground=[      ("readonly", FG),  ("disabled", "#6c7086"),
+                               ("focus",    FG),  ("!focus",   FG)],
+              selectbackground=[("readonly", ENT), ("focus",    ACC),
+                               ("!focus",   ENT)],
+              selectforeground=[("readonly", FG),  ("focus",    "#1e1e2e"),
+                               ("!focus",   FG)],
+              background=[      ("readonly", ENT), ("active",   SEL),
+                               ("focus",    ENT), ("!focus",   ENT)])
         s.configure("TLabelframe",  background=BG, foreground=ACC,
                      font=("Segoe UI",10,"bold"))
         s.configure("TLabelframe.Label", background=BG, foreground=ACC)
@@ -2253,6 +2508,8 @@ class App(tk.Tk):
         tb.pack(fill="x", padx=4, pady=(4,0))
         ttk.Button(tb, text="🔄 Загрузить",
                    command=self._auth_load).pack(side="left", padx=6)
+        ttk.Button(tb, text="💾 Выгрузить в файл",
+                   command=self._auth_export).pack(side="left", padx=(0,6))
         self._auth_status_lbl = tk.Label(
             tb, text="Нажмите «Загрузить» для получения данных",
             bg="#252535", fg="#6c7086", font=("Segoe UI",9))
@@ -2316,6 +2573,70 @@ class App(tk.Tk):
         self._auth_detail.tag_configure("warn",foreground="#f9e2af")
 
     # ── Загрузка данных аутентификации ────────────────────────────────────────
+
+    def _auth_export(self):
+        """Экспортирует настройки аутентификации одновременно в PDF и JSON."""
+        if not self._auth_data:
+            messagebox.showwarning("Нет данных",
+                "Сначала нажмите «Загрузить»"); return
+
+        folder = filedialog.askdirectory(
+            title="Папка для сохранения файлов (PDF + JSON)")
+        if not folder: return
+
+        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(folder, f"zabbix_auth_{ts}")
+        self._busy(True)
+        self._auth_status_lbl.configure(text="Экспорт…")
+
+        def _w():
+            errors = []
+            saved  = []
+
+            # ── JSON ──────────────────────────────────────────────────────
+            try:
+                payload = {
+                    "exported_at":   datetime.datetime.now().isoformat(),
+                    "zabbix_version": getattr(self.zapi, "_api_version_str", ""),
+                    "authentication": self._auth_data,
+                    "user_directories": self._user_dirs,
+                }
+                json_path = base + ".json"
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                saved.append(os.path.basename(json_path))
+            except Exception as ex:
+                errors.append(f"JSON: {ex}")
+
+            # ── PDF ───────────────────────────────────────────────────────
+            if PDF_OK:
+                try:
+                    pdf_path = base + ".pdf"
+                    _auth_to_pdf(pdf_path, self._auth_data, self._user_dirs)
+                    saved.append(os.path.basename(pdf_path))
+                except Exception as ex:
+                    errors.append(f"PDF: {ex}")
+            else:
+                errors.append("PDF: библиотека reportlab не установлена")
+
+            def _done():
+                self._busy(False)
+                if errors:
+                    msg = ("Частичный успех\n\nСохранено: " +
+                           ", ".join(saved) + "\n\nОшибки:\n" +
+                           "\n".join(errors))
+                    self._auth_status_lbl.configure(text="Экспорт завершён с ошибками")
+                    messagebox.showwarning("Экспорт", msg)
+                else:
+                    self._auth_status_lbl.configure(
+                        text=f"Сохранено: {', '.join(saved)}")
+                    messagebox.showinfo("Готово",
+                        f"Файлы сохранены в:\n{folder}\n\n" +
+                        "\n".join(saved))
+            self.after(0, _done)
+
+        threading.Thread(target=_w, daemon=True).start()
+
     def _auth_load(self):
         if not self.zapi:
             messagebox.showwarning("", "Сначала подключитесь"); return
@@ -2585,16 +2906,18 @@ class App(tk.Tk):
                                         state="readonly", width=36)
         self._cmb_cmp_b.grid(row=0, column=3, padx=(0,12))
 
+        ttk.Button(tb, text="🔄 Загрузить шаблоны",
+                   command=self._tpl_exp_load).grid(row=0, column=4, padx=(0,8))
         ttk.Button(tb, text="⚖ Сравнить",
-                   command=self._cmp_run).grid(row=0, column=4, padx=(0,6))
+                   command=self._cmp_run).grid(row=0, column=5, padx=(0,6))
         ttk.Button(tb, text="📄 PDF",
-                   command=self._cmp_export_pdf).grid(row=0, column=5, padx=(0,4))
+                   command=self._cmp_export_pdf).grid(row=0, column=6, padx=(0,4))
         ttk.Button(tb, text="📋 CSV",
-                   command=self._cmp_export_csv).grid(row=0, column=6, padx=(0,10))
+                   command=self._cmp_export_csv).grid(row=0, column=7, padx=(0,10))
 
-        self._cmp_status = tk.Label(tb, text="Выберите два шаблона и нажмите «Сравнить»",
+        self._cmp_status = tk.Label(tb, text="Нажмите «Загрузить шаблоны», затем выберите два и нажмите «Сравнить»",
                                      bg="#252535", fg="#6c7086", font=("Segoe UI",8))
-        self._cmp_status.grid(row=1, column=0, columnspan=7, padx=10, pady=(2,0), sticky="w")
+        self._cmp_status.grid(row=1, column=0, columnspan=8, padx=10, pady=(2,0), sticky="w")
 
         # ── Notebook с разделами результатов ─────────────────────────────────
         self._cmp_nb = ttk.Notebook(parent)
@@ -3054,8 +3377,8 @@ class App(tk.Tk):
         ttk.Label(top, text="Поиск метрики:").pack(side="left")
         self._e_ms = ttk.Entry(top, width=22)
         self._e_ms.pack(side="left", padx=6)
-        ttk.Button(top, text="🔍 Найти",        command=self._load_items).pack(side="left", padx=4)
-        ttk.Button(top, text="📈 История",      command=self._load_history).pack(side="left", padx=2)
+        ttk.Button(top, text="🔍 Загрузить метрики", command=self._load_items).pack(side="left", padx=4)
+        ttk.Button(top, text="📈 Построить график",  command=self._load_history).pack(side="left", padx=2)
 
         mid = tk.Frame(parent, bg="#1e1e2e")
         mid.pack(fill="both", expand=True, padx=8, pady=4)

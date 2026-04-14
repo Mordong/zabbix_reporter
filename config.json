@@ -1,7 +1,7 @@
 {
   "url": "https://zabbix.example.com",
   "user": "Admin",
-  "password": "",
+  "password": "000",
   "verify_ssl": true,
   "severity": 0,
   "limit": "500",
