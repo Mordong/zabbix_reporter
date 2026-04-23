@@ -190,6 +190,20 @@ def dur_str(ts) -> str:
         return f"{h}h {m}m {s}s"
     except: return ""
 
+def dur_str_from(start_ts, end_ts) -> str:
+    """Длительность между двумя timestamps."""
+    try:
+        s = max(0, int(end_ts) - int(start_ts))
+        d, rem = divmod(s, 86400)
+        h, rem = divmod(rem, 3600)
+        m, ss  = divmod(rem, 60)
+        if d: return f"{d}d {h}h {m}m"
+        if h: return f"{h}h {m}m {ss}s"
+        if m: return f"{m}m {ss}s"
+        return f"{ss}s"
+    except Exception:
+        return ""
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -628,6 +642,309 @@ def _auth_to_pdf(path: str, auth_data: dict, user_dirs: list):
 
     doc.build(st, onFirstPage=_on_page, onLaterPages=_on_page)
 
+
+
+def _dupes_to_csv(path: str, groups: list):
+    """Сохраняет все группы дубликатов в один CSV файл."""
+    import csv
+    headers = ["Тип дубликата", "Причина", "Host name", "Видимое имя",
+               "Группы", "IP / интерфейсы", "Статус", "Доступность", "Host ID"]
+    TYPE_LABELS = {"hostname": "По hostname", "ip": "По IP"}
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for tk_, g in groups:
+            label  = TYPE_LABELS.get(tk_, tk_)
+            reason = g["reason"]
+            for h in g["hosts"]:
+                ifaces = h.get("interfaces", [])
+                ip_parts = []
+                for iface in ifaces:
+                    ip = iface.get("ip","").strip()
+                    if ip and ip not in ("","0.0.0.0"):
+                        itype = IFACE_TYPE.get(str(iface.get("type","1")),"?")
+                        ip_parts.append(f"{itype}:{ip}")
+                grps     = ", ".join(g2.get("name","")
+                                     for g2 in h.get("groups", h.get("hostgroups",[])))
+                status   = HOST_STATUS.get(str(h.get("status","0")),"?")
+                avail, _, _ = _iface_avail_str(ifaces)
+                w.writerow([label, reason,
+                            h.get("host",""), h.get("name",""),
+                            grps, "  ".join(ip_parts) or "—",
+                            status, avail, h.get("hostid","")])
+
+
+def _dupes_to_pdf(path: str, groups: list, total_hosts: int):
+    """Генерирует PDF-отчёт по найденным дубликатам хостов."""
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, PageBreak, HRFlowable)
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    doc = SimpleDocTemplate(
+        path, pagesize=A4,
+        topMargin=22*mm, bottomMargin=16*mm,
+        leftMargin=14*mm, rightMargin=14*mm)
+    W = A4[0] - 28*mm
+
+    ss  = getSampleStyleSheet()
+    kb  = {"parent": ss["Normal"], "fontName": _PDF_FONT}
+    kbd = {"parent": ss["Normal"], "fontName": _PDF_FONT_BOLD}
+    S = {
+        "title": ParagraphStyle("DT",  **kbd, fontSize=18, leading=22,
+                                textColor=HexColor("#0F3460")),
+        "sub":   ParagraphStyle("DS",  **kb,  fontSize=9,  leading=12,
+                                textColor=HexColor("#888888")),
+        "h1":    ParagraphStyle("DH1", **kbd, fontSize=12, leading=15,
+                                textColor=HexColor("#0F3460"), spaceBefore=8),
+        "h2":    ParagraphStyle("DH2", **kbd, fontSize=10, leading=13,
+                                textColor=HexColor("#E94560"), spaceBefore=5),
+        "body":  ParagraphStyle("DB",  **kb,  fontSize=8,  leading=10,
+                                textColor=HexColor("#333333"), wordWrap="CJK"),
+        "hdr":   ParagraphStyle("DHdr",**kbd, fontSize=8,  leading=10,
+                                textColor=colors.white),
+        "warn":  ParagraphStyle("DW",  **kb,  fontSize=8,  leading=10,
+                                textColor=HexColor("#E65100")),
+    }
+
+    TYPE_LABELS  = {"hostname": "По hostname", "ip": "По IP адресу"}
+    TYPE_COLORS  = {
+        "hostname": HexColor("#FFF9C4"),
+        "ip":       HexColor("#FFCDD2"),
+    }
+    TYPE_HDR = {
+        "hostname": HexColor("#F9A825"),
+        "ip":       HexColor("#C62828"),
+    }
+
+    def _tbl(headers, rows, weights, hdr_color=None):
+        total = sum(weights)
+        cw    = [W * w / total for w in weights]
+        hc    = hdr_color or HexColor("#0F3460")
+        hrow  = [Paragraph(h, S["hdr"]) for h in headers]
+        brows = [[Paragraph(str(v) if v is not None else "—", S["body"])
+                  for v in row] for row in rows]
+        ts = TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0), hc),
+            ("GRID",          (0,0),(-1,-1), 0.3, HexColor("#CCCCCC")),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),
+             [HexColor("#FAFAFA"), HexColor("#FFFFFF")]),
+            ("TOPPADDING",    (0,0),(-1,-1), 3),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+            ("LEFTPADDING",   (0,0),(-1,-1), 5),
+            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+            ("FONTSIZE",      (0,1),(-1,-1), 7),
+        ])
+        t = Table([hrow]+brows, colWidths=cw, repeatRows=1)
+        t.setStyle(ts)
+        return t
+
+    st = []
+    by_type   = {}
+    for tk_, g in groups:
+        by_type.setdefault(tk_, []).append(g)
+
+    total_groups = len(groups)
+    total_dup    = sum(len(g["hosts"]) for _, g in groups)
+
+    # ── Титул ──────────────────────────────────────────────────────────────
+    st += [
+        Paragraph("Отчёт: Дубликаты хостов Zabbix", S["title"]),
+        Spacer(1, 2*mm),
+        Paragraph(f"Сформирован: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+                  S["sub"]),
+        Paragraph(f"Всего хостов проанализировано: {total_hosts}  |  "
+                  f"Групп дубликатов: {total_groups}  |  "
+                  f"Хостов в дубликатах: {total_dup}", S["sub"]),
+        HRFlowable(width=W, color=HexColor("#E94560"), thickness=2),
+        Spacer(1, 5*mm),
+    ]
+
+    # ── Сводка ─────────────────────────────────────────────────────────────
+    sum_rows = []
+    for tk_, label in TYPE_LABELS.items():
+        grps = by_type.get(tk_, [])
+        hosts_cnt = sum(len(g["hosts"]) for g in grps)
+        sum_rows.append((label, str(len(grps)), str(hosts_cnt)))
+    st += [
+        Paragraph("Сводка по типам дубликатов", S["h1"]),
+        Spacer(1, 2*mm),
+        _tbl(["Тип дубликата", "Групп", "Хостов затронуто"],
+             sum_rows, [50, 15, 20]),
+        Spacer(1, 6*mm),
+    ]
+
+    # ── По каждому типу ────────────────────────────────────────────────────
+    for tk_, label in TYPE_LABELS.items():
+        grp_list = by_type.get(tk_, [])
+        if not grp_list:
+            continue
+        st += [
+            PageBreak(),
+            Paragraph(f"Тип: {label}", S["h1"]),
+            Spacer(1, 3*mm),
+        ]
+        hdr_c = TYPE_HDR.get(tk_, HexColor("#0F3460"))
+        for g in grp_list:
+            st.append(Paragraph(f"⚠  {g['reason']}", S["h2"]))
+            rows = []
+            for h in g["hosts"]:
+                ifaces   = h.get("interfaces", [])
+                ip_parts = []
+                for iface in ifaces:
+                    ip = iface.get("ip","").strip()
+                    if ip and ip not in ("","0.0.0.0"):
+                        itype = IFACE_TYPE.get(str(iface.get("type","1")),"?")
+                        ip_parts.append(f"{itype}:{ip}")
+                grps_str = ", ".join(
+                    g2.get("name","") for g2 in
+                    h.get("groups", h.get("hostgroups",[])))
+                status   = HOST_STATUS.get(str(h.get("status","0")),"?")
+                avail, _, _ = _iface_avail_str(ifaces)
+                rows.append((
+                    h.get("host",""),
+                    h.get("name",""),
+                    grps_str[:60],
+                    "  ".join(ip_parts) or "—",
+                    status,
+                    avail,
+                ))
+            st += [
+                _tbl(["Host name","Visible name","Группы",
+                      "IP / интерфейсы","Статус","Доступн."],
+                     rows, [20, 18, 20, 22, 9, 10], hdr_color=hdr_c),
+                Spacer(1, 5*mm),
+            ]
+
+    def _on_page(canvas, doc):
+        canvas.saveState()
+        w, h = A4
+        canvas.setFillColor(HexColor("#0F3460"))
+        canvas.rect(0, h-18*mm, w, 18*mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont(_PDF_FONT_BOLD, 10)
+        canvas.drawString(14*mm, h-11*mm, "Zabbix Reporter v3.0 — Дубликаты хостов")
+        canvas.setFont(_PDF_FONT, 8)
+        canvas.drawRightString(w-14*mm, h-11*mm,
+                               datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        canvas.setFillColor(HexColor("#0F3460"))
+        canvas.rect(0, 0, w, 9*mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont(_PDF_FONT, 7)
+        canvas.drawCentredString(w/2, 3*mm,
+                                 f"Страница {doc.page}  |  Zabbix Reporter v3.0")
+        canvas.restoreState()
+
+    doc.build(st, onFirstPage=_on_page, onLaterPages=_on_page)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Поиск дубликатов хостов
+# ══════════════════════════════════════════════════════════════════════════════
+import re as _re
+
+def _normalize_hostname(name: str) -> str:
+    """Приводит имя к нижнему регистру для сравнения."""
+    return name.strip().lower()
+
+def _short_name(name: str) -> str:
+    """Возвращает короткое имя (до первой точки) в нижнем регистре."""
+    return name.strip().lower().split(".")[0]
+
+def _is_fqdn(name: str) -> bool:
+    """Проверяет, является ли имя FQDN (содержит точку, кроме trailing dot)."""
+    return "." in name.strip().rstrip(".")
+
+def find_duplicates(hosts: list) -> dict:
+    """
+    Находит дубликаты хостов по двум категориям.
+    Возвращает:
+      {
+        "by_hostname": [ {"reason", "key", "hosts": [...]}, ... ],
+        "by_ip":       [ ... ],
+      }
+    Категория by_hostname объединяет дубликаты:
+      - имена совпадают без учёта регистра
+      - одинаковое short-name, но разный формат (short vs FQDN)
+    """
+    # ── Дубликаты по имени хоста ──────────────────────────────────────────
+    # Ключ группировки: short-name в нижнем регистре.
+    # Все хосты с одинаковым short-name — потенциальные дубликаты.
+    short_groups: dict = {}   # short_lower -> [host, ...]
+    for h in hosts:
+        raw = h.get("host", "").strip()
+        if not raw:
+            continue
+        short_groups.setdefault(_short_name(raw), []).append(h)
+
+    by_hostname = []
+    for short, group in short_groups.items():
+        if len(group) < 2:
+            continue
+        # Собрать детали группы
+        names_exact    = [_normalize_hostname(h["host"]) for h in group]
+        has_case_dup   = len(set(names_exact)) < len(names_exact)  # точные дубликаты по регистру
+        unique_names   = set(names_exact)
+        has_short_fqdn = (
+            any(not _is_fqdn(h["host"]) for h in group) and
+            any(_is_fqdn(h["host"])      for h in group)
+        )
+        reasons = []
+        if has_case_dup:
+            reasons.append("разный регистр")
+        if has_short_fqdn:
+            reasons.append("short vs FQDN")
+        if len(unique_names) > 1 and not reasons:
+            reasons.append("разные варианты написания")
+        if not reasons and len(unique_names) == 1:
+            reasons.append("точные дубликаты")
+        by_hostname.append({
+            "type":   "По hostname",
+            "reason": f"Совпадает short-name «{short}» ({', '.join(reasons)})",
+            "key":    short,
+            "hosts":  group,
+        })
+
+    # ── Дубликаты по IP адресу ────────────────────────────────────────────
+    # Группируем по (ip, тип_интерфейса). Пустые IP пропускаем.
+    ip_groups: dict = {}
+    for h in hosts:
+        for iface in h.get("interfaces", []):
+            ip = (iface.get("ip") or "").strip()
+            # Фильтруем ТОЛЬКО пустые и 0.0.0.0; 127.0.0.1 — валидный
+            # IP для локальных агентов и встречается у многих хостов
+            if not ip or ip == "0.0.0.0":
+                continue
+            itype = str(iface.get("type", "1"))
+            key   = (ip, itype)
+            ip_groups.setdefault(key, []).append((h, iface))
+
+    by_ip = []
+    for (ip, itype), pairs in ip_groups.items():
+        # Уникальные хосты в группе
+        unique_host_ids = []
+        seen_ids = set()
+        unique_hosts = []
+        for h, _ in pairs:
+            if h["hostid"] not in seen_ids:
+                seen_ids.add(h["hostid"])
+                unique_host_ids.append(h["hostid"])
+                unique_hosts.append(h)
+        if len(unique_hosts) < 2:
+            continue
+        type_name = IFACE_TYPE.get(itype, f"Type{itype}")
+        by_ip.append({
+            "type":   "По IP",
+            "reason": f"IP {ip} в интерфейсе {type_name}",
+            "key":    ip,
+            "itype":  itype,
+            "hosts":  unique_hosts,
+        })
+
+    return {"by_hostname": by_hostname, "by_ip": by_ip}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Zabbix JSON-RPC API клиент
 # ══════════════════════════════════════════════════════════════════════════════
@@ -968,21 +1285,54 @@ class ZabbixAPI:
 
         return dirs
 
-    def get_events(self, time_from, time_till, limit=1000):
+    def get_events(self, time_from, time_till, limit=1000,
+                   severities=None, hostids=None):
         """
         Zabbix 6.0+: event.get не поддерживает selectHosts напрямую.
         Имена хостов резолвим через trigger.get по objectid.
+        Время восстановления: event.get value:1 не содержит r_clock;
+        берём recovery события (value:0) и сопоставляем по r_eventid.
         """
-        events = self._call("event.get", {
+        params = {
             "output": "extend",
             "time_from": time_from, "time_till": time_till,
             "sortfield": ["clock", "eventid"], "sortorder": "DESC",
             "limit": limit, "value": 1,
-            "source": 0,   # только триггерные события
-        })
+            "source": 0,
+            "selectRelatedObject": ["triggerid"],
+        }
+        if severities:
+            params["severities"] = severities
+        if hostids:
+            params["hostids"] = hostids
+        events = self._call("event.get", params)
         if not events:
             return events
 
+        # Получаем recovery-события чтобы знать r_clock
+        event_ids = [e["eventid"] for e in events]
+        try:
+            recoveries = self._call("event.get", {
+                "output":      ["eventid", "clock", "r_eventid"],
+                "eventids":    [e.get("r_eventid","0") for e in events
+                                if e.get("r_eventid","0") not in ("","0")],
+                "source":      0,
+            })
+            # r_eventid в problem указывает на recovery event;
+            # recovery event имеет clock — время восстановления
+            rec_map = {r["eventid"]: r.get("clock","0") for r in recoveries}
+            for e in events:
+                rid = e.get("r_eventid","0")
+                if rid and rid != "0" and rid in rec_map:
+                    e["r_clock"] = rec_map[rid]
+                else:
+                    e["r_clock"] = e.get("r_clock","0") or "0"
+        except Exception:
+            for e in events:
+                if "r_clock" not in e:
+                    e["r_clock"] = "0"
+
+        # Резолвим хосты через триггеры
         trigger_ids = list({e["objectid"] for e in events if e.get("objectid")})
         if trigger_ids:
             triggers = self._call("trigger.get", {
@@ -2110,7 +2460,8 @@ class App(tk.Tk):
         self._events       = []
         self._metrics      = {}
         self._items_cache  = []
-        self._hosts_detail = []   # расширенные данные вкладки «Объекты»
+        self._hosts_detail    = []  # расширенные данные хостов
+        self._hosts_latest_ok = {}  # hostid -> True/False (свежие данные)
         self._auth_data    = {}   # authentication.get
         self._user_dirs    = []   # userdirectory.get
         self._log_win      = None   # окно лога (Toplevel)
@@ -3301,6 +3652,268 @@ class App(tk.Tk):
             self.after(0, _done)
         threading.Thread(target=_w, daemon=True).start()
 
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Вкладка «Дубликаты хостов»
+    # ════════════════════════════════════════════════════════════════════════
+    def _build_dupes_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        # ── Toolbar ───────────────────────────────────────────────────────
+        tb = tk.Frame(parent, bg="#252535", pady=6)
+        tb.pack(fill="x", padx=4, pady=(4, 0))
+
+        ttk.Button(tb, text="🔍 Найти дубликаты",
+                   command=self._dupes_run).pack(side="left", padx=6)
+        ttk.Button(tb, text="📄 PDF",
+                   command=self._dupes_export_pdf).pack(side="left", padx=(0, 4))
+        ttk.Button(tb, text="📋 CSV",
+                   command=self._dupes_export_csv).pack(side="left", padx=(0, 8))
+
+        # Фильтры типов
+        tk.Label(tb, text="Показать:", bg="#252535", fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 4))
+        self._dupes_show_hostname = tk.BooleanVar(value=True)
+        self._dupes_show_ip       = tk.BooleanVar(value=True)
+        for var, text in [(self._dupes_show_hostname, "По hostname"),
+                          (self._dupes_show_ip,       "По IP")]:
+            tk.Checkbutton(tb, text=text, variable=var,
+                           bg="#252535", fg=FG, selectcolor="#313244",
+                           activebackground="#252535", activeforeground=ACC,
+                           font=("Segoe UI", 9),
+                           command=self._dupes_apply_filter).pack(side="left", padx=2)
+
+        self._dupes_status = tk.Label(
+            tb, text="Нажмите «Найти дубликаты» (используются загруженные хосты)",
+            bg="#252535", fg="#6c7086", font=("Segoe UI", 8))
+        self._dupes_status.pack(side="left", padx=10)
+
+        # ── PanedWindow: список групп (слева) + детали группы (справа) ───
+        paned = tk.PanedWindow(parent, orient="horizontal",
+                               bg=BG, sashwidth=5, sashrelief="flat")
+        paned.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # ── Левая часть — список групп дубликатов ─────────────────────────
+        left = tk.Frame(paned, bg=BG)
+        paned.add(left, minsize=280)
+
+        tk.Label(left, text="Группы дубликатов",
+                 bg=BG, fg=ACC,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=6, pady=(4, 2))
+
+        cols_g = ("Тип", "Описание", "Хостов")
+        self._tree_dupes_groups = ttk.Treeview(
+            left, columns=cols_g, show="headings", selectmode="browse")
+        for col, w in zip(cols_g, (90, 240, 60)):
+            self._tree_dupes_groups.heading(col, text=col)
+            self._tree_dupes_groups.column(col, width=w, minwidth=40)
+        vs_g = ttk.Scrollbar(left, orient="vertical",
+                              command=self._tree_dupes_groups.yview)
+        self._tree_dupes_groups.configure(yscrollcommand=vs_g.set)
+        self._tree_dupes_groups.pack(side="left", fill="both", expand=True)
+        vs_g.pack(side="right", fill="y")
+
+        # Цвета типов
+        self._tree_dupes_groups.tag_configure("hostname", foreground="#f9e2af")
+        self._tree_dupes_groups.tag_configure("ip",       foreground="#f38ba8")
+
+        self._tree_dupes_groups.bind("<<TreeviewSelect>>",
+                                      self._dupes_on_group_select)
+
+        # ── Правая часть — детали выбранной группы ────────────────────────
+        right = tk.Frame(paned, bg=BG2)
+        paned.add(right, minsize=400)
+
+        tk.Label(right, text="  Детали группы дубликатов",
+                 bg=BG2, fg=ACC,
+                 font=("Segoe UI", 10, "bold")).pack(fill="x", pady=(8, 2))
+        ttk.Separator(right).pack(fill="x")
+
+        # Таблица хостов в группе
+        cols_d = ("Host name", "Видимое имя", "Группы", "IP / интерфейсы",
+                  "Статус", "Доступн.")
+        frm_tree = tk.Frame(right, bg=BG2)
+        frm_tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._tree_dupes_detail = ttk.Treeview(
+            frm_tree, columns=cols_d, show="headings", selectmode="browse")
+        for col, w in zip(cols_d, (160, 160, 160, 200, 70, 80)):
+            self._tree_dupes_detail.heading(col, text=col)
+            self._tree_dupes_detail.column(col, width=w, minwidth=40)
+        vs_d = ttk.Scrollbar(frm_tree, orient="vertical",
+                              command=self._tree_dupes_detail.yview)
+        hs_d = ttk.Scrollbar(frm_tree, orient="horizontal",
+                              command=self._tree_dupes_detail.xview)
+        self._tree_dupes_detail.configure(yscrollcommand=vs_d.set,
+                                           xscrollcommand=hs_d.set)
+        self._tree_dupes_detail.grid(row=0, column=0, sticky="nsew")
+        vs_d.grid(row=0, column=1, sticky="ns")
+        hs_d.grid(row=1, column=0, sticky="ew")
+        frm_tree.rowconfigure(0, weight=1); frm_tree.columnconfigure(0, weight=1)
+
+        self._tree_dupes_detail.tag_configure("enabled",  foreground="#a6e3a1")
+        self._tree_dupes_detail.tag_configure("disabled", foreground="#6c7086")
+
+        # Блок с пояснением причины
+        self._dupes_reason_lbl = tk.Label(
+            right, text="", bg=BG2, fg="#f9e2af",
+            font=("Segoe UI", 9), anchor="w", wraplength=600)
+        self._dupes_reason_lbl.pack(fill="x", padx=8, pady=(0, 6))
+
+        # Внутреннее состояние
+        self._dupes_result      = {}   # {by_name, by_fqdn, by_ip}
+        self._dupes_all_groups  = []   # [(type_key, group_dict), ...]
+        self._dupes_filtered    = []   # отфильтрованный список
+
+    # ── Поиск дубликатов ──────────────────────────────────────────────────
+    def _dupes_run(self):
+        if not self._hosts:
+            messagebox.showwarning("Нет данных",
+                "Сначала загрузите хосты (кнопка «Обновить все данные»)")
+            return
+        self._busy(True)
+        self._dupes_status.configure(text="Анализ…")
+
+        def _w():
+            try:
+                result = find_duplicates(self._hosts)
+                self.after(0, lambda: self._dupes_populate(result))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._dupes_status.configure(text=f"Ошибка: {m}"),
+                    self.log(f"  [Dupes] Ошибка: {m}", "err")))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _dupes_populate(self, result):
+        self._dupes_result = result
+
+        # Собрать плоский список всех групп
+        all_groups = []
+        for g in result.get("by_hostname", []):
+            all_groups.append(("hostname", g))
+        for g in result.get("by_ip", []):
+            all_groups.append(("ip", g))
+        self._dupes_all_groups = all_groups
+
+        total = len(all_groups)
+        total_hosts = sum(len(g["hosts"]) for _, g in all_groups)
+        self._dupes_status.configure(
+            text=f"Найдено групп дубликатов: {total}  (затронуто хостов: {total_hosts})")
+        self.log(f"  [Dupes] Групп: {total}, хостов: {total_hosts}", "ok")
+
+        self._dupes_apply_filter()
+        self._busy(False)
+
+    def _dupes_apply_filter(self):
+        """Применить фильтры и перерисовать список групп."""
+        show = {
+            "hostname": self._dupes_show_hostname.get(),
+            "ip":       self._dupes_show_ip.get(),
+        }
+        filtered = [(tk, g) for tk, g in self._dupes_all_groups if show.get(tk, True)]
+        self._dupes_filtered = filtered
+
+        t = self._tree_dupes_groups
+        t.delete(*t.get_children())
+        TYPE_LABELS = {"hostname": "По hostname", "ip": "По IP"}
+        for i, (tk_, g) in enumerate(filtered):
+            label = TYPE_LABELS.get(tk_, tk_)
+            reason_short = g["reason"]
+            if len(reason_short) > 55:
+                reason_short = reason_short[:52] + "…"
+            cnt = len(g["hosts"])
+            t.insert("", "end",
+                     values=(label, reason_short, cnt),
+                     tags=(tk_,),
+                     iid=str(i))
+
+        # Сбросить детали
+        self._tree_dupes_detail.delete(*self._tree_dupes_detail.get_children())
+        self._dupes_reason_lbl.configure(text="")
+
+    def _dupes_on_group_select(self, event=None):
+        sel = self._tree_dupes_groups.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if idx >= len(self._dupes_filtered):
+            return
+        tk_, group = self._dupes_filtered[idx]
+        self._dupes_show_group(group)
+
+    def _dupes_show_group(self, group):
+        """Показать хосты выбранной группы дубликатов."""
+        t = self._tree_dupes_detail
+        t.delete(*t.get_children())
+        self._dupes_reason_lbl.configure(text=f"⚠ {group['reason']}")
+
+        for h in group["hosts"]:
+            ifaces = h.get("interfaces", [])
+            # Собрать все IP интерфейсов
+            ip_parts = []
+            for iface in ifaces:
+                ip = iface.get("ip","").strip()
+                if ip and ip not in ("", "0.0.0.0"):
+                    itype = IFACE_TYPE.get(str(iface.get("type","1")), "?")
+                    ip_parts.append(f"{itype}:{ip}")
+            ip_str = "  ".join(ip_parts) if ip_parts else "—"
+
+            grps = ", ".join(g.get("name","") for g in
+                             h.get("groups", h.get("hostgroups",[])))
+            status = HOST_STATUS.get(str(h.get("status","0")), "?")
+            avail_str, _, _ = _iface_avail_str(ifaces)
+
+            tag = "enabled" if str(h.get("status","0")) == "0" else "disabled"
+            t.insert("", "end",
+                     values=(h.get("host",""), h.get("name",""),
+                             grps, ip_str, status, avail_str),
+                     tags=(tag,))
+
+    # ── Экспорт ───────────────────────────────────────────────────────────
+    def _dupes_export_pdf(self):
+        if not self._dupes_all_groups:
+            messagebox.showwarning("", "Сначала выполните поиск"); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf", filetypes=[("PDF","*.pdf")],
+            initialfile=f"duplicates_{datetime.date.today()}.pdf")
+        if not path: return
+        self._busy(True)
+        groups = self._dupes_filtered or self._dupes_all_groups
+        def _w():
+            try:
+                _dupes_to_pdf(path, groups, len(self._hosts))
+                self.after(0, lambda: (self._busy(False),
+                    self._info(f"PDF: {path}"),
+                    messagebox.showinfo("Готово", f"PDF сохранён:\n{path}")))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (self._busy(False),
+                    messagebox.showerror("Ошибка PDF", m)))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _dupes_export_csv(self):
+        if not self._dupes_all_groups:
+            messagebox.showwarning("", "Сначала выполните поиск"); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV","*.csv")],
+            initialfile=f"duplicates_{datetime.date.today()}.csv")
+        if not path: return
+        self._busy(True)
+        groups = self._dupes_filtered or self._dupes_all_groups
+        def _w():
+            try:
+                _dupes_to_csv(path, groups)
+                self.after(0, lambda: (self._busy(False),
+                    self._info(f"CSV: {path}"),
+                    messagebox.showinfo("Готово", f"CSV сохранён:\n{path}")))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (self._busy(False),
+                    messagebox.showerror("Ошибка CSV", m)))
+        threading.Thread(target=_w, daemon=True).start()
+
     # ── Вкладки ───────────────────────────────────────────────────────────────
     def _build_tabs(self, parent):
         nb = ttk.Notebook(parent); nb.pack(fill="both", expand=True)
@@ -3311,20 +3924,13 @@ class App(tk.Tk):
             (118,360,160,152,108,68))
 
         t2 = ttk.Frame(nb); nb.add(t2, text=" 🖥 Хосты ")
-        self._tree_h = self._tv(t2,
-            ("Хост","Имя","Группа","Статус","Доступн.","Интерфейсы","Тригг.","Обслуж."),
-            (140,160,140,80,100,200,55,150))
+        self._build_hosts_tab(t2)
 
         t3 = ttk.Frame(nb); nb.add(t3, text=" 📋 События ")
-        self._tree_e = self._tv(t3,
-            ("ID","Серьёзность","Событие","Хост","Время","Восст."),
-            (80,118,340,155,152,130))
+        self._build_events_tab(t3)
 
         t4 = ttk.Frame(nb); nb.add(t4, text=" 📈 Метрики ")
         self._build_metrics_tab(t4)
-
-        t6 = ttk.Frame(nb); nb.add(t6, text=" 🗂 Объекты ")
-        self._build_objects_tab(t6)
 
         t7 = ttk.Frame(nb); nb.add(t7, text=" 🔐 Аутентификация ")
         self._build_auth_tab(t7)
@@ -3332,10 +3938,13 @@ class App(tk.Tk):
         t8 = ttk.Frame(nb); nb.add(t8, text=" ⚖ Сравнение ")
         self._build_compare_tab(t8)
 
-        t9 = ttk.Frame(nb); nb.add(t9, text=" 📤 Экспорт шаблонов ")
+        t9  = ttk.Frame(nb); nb.add(t9,  text=" 📤 Экспорт шаблонов ")
         self._build_tpl_export_tab(t9)
 
-        t5 = ttk.Frame(nb); nb.add(t5, text=" 📊 Сводка ")
+        t10 = ttk.Frame(nb); nb.add(t10, text=" 🔎 Дубликаты ")
+        self._build_dupes_tab(t10)
+
+        t5  = ttk.Frame(nb); nb.add(t5,  text=" 📊 Сводка ")
         self._sum_txt = tk.Text(t5, bg="#181825", fg="#cdd6f4",
                                  font=("Consolas",11), relief="flat",
                                  state="disabled", padx=20, pady=12)
@@ -3343,6 +3952,457 @@ class App(tk.Tk):
         self._sum_txt.configure(yscrollcommand=sb.set)
         self._sum_txt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Вкладка «Хосты» — объединяет список и детальную карточку
+    # ════════════════════════════════════════════════════════════════════════
+    def _build_hosts_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#252535"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        # Toolbar с фильтрами
+        tb = tk.Frame(parent, bg=BG2, pady=4)
+        tb.pack(fill="x", padx=4, pady=(4, 0))
+
+        tk.Label(tb, text="Фильтр:", bg=BG2, fg=ACC,
+                 font=("Segoe UI", 9, "bold")).grid(row=0, column=0, padx=(10,4))
+
+        tk.Label(tb, text="Группа:", bg=BG2, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=0, column=1, padx=(0,2))
+        self._hosts_grp_var = tk.StringVar(value="— все —")
+        self._cmb_hosts_grp = ttk.Combobox(tb, textvariable=self._hosts_grp_var,
+                                            state="readonly", width=22)
+        self._cmb_hosts_grp.grid(row=0, column=2, padx=(0,8))
+
+        tk.Label(tb, text="Шаблон:", bg=BG2, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=0, column=3, padx=(0,2))
+        self._hosts_tpl_var = tk.StringVar(value="— все —")
+        self._cmb_hosts_tpl = ttk.Combobox(tb, textvariable=self._hosts_tpl_var,
+                                            state="readonly", width=26)
+        self._cmb_hosts_tpl.grid(row=0, column=4, padx=(0,8))
+
+        tk.Label(tb, text="🔍", bg=BG2, fg=FG).grid(row=0, column=5, padx=(0,2))
+        self._hosts_search_var = tk.StringVar()
+        self._hosts_search_var.trace_add("write",
+            lambda *_: self._hosts_apply_filter())
+        ttk.Entry(tb, textvariable=self._hosts_search_var,
+                  width=22).grid(row=0, column=6, padx=(0,6))
+
+        ttk.Button(tb, text="🔄 Обновить расширенно",
+                   command=self._hosts_load_detail).grid(row=0, column=7, padx=(0,4))
+
+        self._hosts_status = tk.Label(
+            tb, text="Двойной клик по хосту — открыть карточку",
+            bg=BG2, fg="#6c7086", font=("Segoe UI", 8))
+        self._hosts_status.grid(row=1, column=0, columnspan=8,
+                                 padx=10, pady=(2,0), sticky="w")
+
+        self._cmb_hosts_grp.bind("<<ComboboxSelected>>",
+                                  lambda _: self._hosts_apply_filter())
+        self._cmb_hosts_tpl.bind("<<ComboboxSelected>>",
+                                  lambda _: self._hosts_apply_filter())
+
+        # Таблица хостов
+        cols = ("Хост", "Имя", "Группы", "Шаблоны",
+                "Статус", "Доступн.", "Интерфейсы",
+                "Agent ver.", "Тригг.", "Обслуж.")
+        widths = (130, 140, 140, 160, 70, 90, 180, 80, 55, 130)
+
+        tree_frm = tk.Frame(parent, bg=BG)
+        tree_frm.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._tree_h = ttk.Treeview(tree_frm, columns=cols,
+                                     show="headings", selectmode="browse")
+        for col, w in zip(cols, widths):
+            self._tree_h.heading(col, text=col,
+                command=lambda c=col, t=self._tree_h: self._sort(t, c))
+            self._tree_h.column(col, width=w, minwidth=40)
+        vs = ttk.Scrollbar(tree_frm, orient="vertical", command=self._tree_h.yview)
+        hs = ttk.Scrollbar(tree_frm, orient="horizontal", command=self._tree_h.xview)
+        self._tree_h.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self._tree_h.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        hs.grid(row=1, column=0, sticky="ew")
+        tree_frm.rowconfigure(0, weight=1); tree_frm.columnconfigure(0, weight=1)
+
+        self._tree_h._all = []
+        self._tree_h.tag_configure("ok",    foreground="#a6e3a1")
+        self._tree_h.tag_configure("bad",   foreground="#f38ba8")
+        self._tree_h.tag_configure("unk",   foreground="#f9e2af")
+        self._tree_h.tag_configure("maint", foreground="#fab387")
+
+        # Двойной клик по строке → окно карточки
+        self._tree_h.bind("<Double-1>", self._hosts_open_card)
+        self._tree_h.bind("<Return>",   self._hosts_open_card)
+
+        # Кеш agent-версий и доступности latest data по hostid
+        self._hosts_agent_ver = {}   # hostid -> str
+        self._hosts_latest_ok = {}   # hostid -> set of iface types seen as working
+
+    # ── Загрузка расширенных данных (group names + templates + agent ver) ──
+    def _hosts_load_detail(self):
+        if not self.zapi:
+            messagebox.showwarning("", "Подключитесь к Zabbix"); return
+        self._busy(True)
+        self._hosts_status.configure(text="Загрузка расширенных данных…")
+        def _w():
+            try:
+                detail = self.zapi.get_hosts_detail()
+                latest_ok = self.zapi.get_hosts_latest_activity(
+                    [h["hostid"] for h in (self._hosts or [])],
+                    age_seconds=900)  # 15 минут
+                self.after(0, lambda: self._hosts_populate_detail(detail, latest_ok))
+            except Exception as ex:
+                msg = str(ex)
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._hosts_status.configure(text=f"Ошибка: {m}"),
+                    self.log(f"  [Hosts] Ошибка: {m}", "err")))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _hosts_populate_detail(self, detail, latest_ok):
+        """
+        detail — результат get_hosts_detail (с templates/macros/tags/agent ver)
+        latest_ok — {hostid: bool}  — хост имеет свежие данные
+        """
+        self._hosts_detail = detail or []
+        self._hosts_latest_ok = latest_ok or {}
+
+        # Карта hostid -> детальный объект
+        det_by_id = {d["hostid"]: d for d in self._hosts_detail}
+
+        # Обогащаем _hosts данными: templates, agent version
+        for h in (self._hosts or []):
+            d = det_by_id.get(h["hostid"])
+            if d:
+                h["_templates"] = d.get("parentTemplates", [])
+                h["_agent_version"] = d.get("_agent_version", "")
+                h["_tags"]      = d.get("tags", [])
+                h["_macros"]    = d.get("macros", [])
+
+        # Обновить выпадающие списки фильтров
+        grps = set(); tpls = set()
+        for d in self._hosts_detail:
+            for g in d.get("groups", d.get("hostgroups", [])):
+                grps.add(g.get("name",""))
+            for t in d.get("parentTemplates", []):
+                tpls.add(t.get("name",""))
+        self._cmb_hosts_grp["values"] = ["— все —"] + sorted(filter(None, grps))
+        self._cmb_hosts_tpl["values"] = ["— все —"] + sorted(filter(None, tpls))
+
+        # Перерисовать таблицу
+        self._fill_h(self._hosts or [])
+        self._busy(False)
+        self._hosts_status.configure(
+            text=f"Расширенные данные загружены: {len(self._hosts_detail)} хостов")
+        self.log(f"  [Hosts] Детали: {len(self._hosts_detail)}", "ok")
+
+    def _hosts_apply_filter(self):
+        """Применить фильтры к уже заполненной таблице."""
+        if not hasattr(self._tree_h, "_all") or not self._tree_h._all:
+            return
+        grp = self._hosts_grp_var.get()
+        tpl = self._hosts_tpl_var.get()
+        q   = self._hosts_search_var.get().lower().strip()
+
+        # Перезаполняем
+        t = self._tree_h
+        t.delete(*t.get_children())
+        for iid, row, h in self._tree_h._all:
+            # Фильтр по группе
+            if grp and grp != "— все —":
+                host_grps = [g.get("name","") for g in
+                             h.get("groups", h.get("hostgroups",[]))]
+                if grp not in host_grps:
+                    continue
+            # Фильтр по шаблону
+            if tpl and tpl != "— все —":
+                host_tpls = [tp.get("name","") for tp in h.get("_templates",[])]
+                if tpl not in host_tpls:
+                    continue
+            # Текстовый поиск
+            if q and q not in " ".join(str(v) for v in row).lower():
+                continue
+            tag = ("maint" if str(h.get("maintenance_status","0")) == "1" else
+                   "ok"    if row[5] == "Available" else
+                   "bad"   if row[5] == "Unavailable" else "unk")
+            t.insert("", "end", values=row, tags=(tag,), iid=h["hostid"])
+
+    def _hosts_open_card(self, event=None):
+        """Открывает модальное окно с карточкой хоста."""
+        sel = self._tree_h.selection()
+        if not sel:
+            return
+        hostid = sel[0]
+        # Ищем полный объект — в _hosts_detail если есть, иначе в _hosts
+        d = None
+        for x in (self._hosts_detail or []):
+            if x.get("hostid") == hostid:
+                d = x
+                break
+        if not d:
+            for x in (self._hosts or []):
+                if x.get("hostid") == hostid:
+                    d = x
+                    break
+        if not d:
+            return
+        self._open_host_card_window(d)
+
+    def _open_host_card_window(self, h):
+        """Модальное окно с полной карточкой хоста."""
+        BG = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+        win = tk.Toplevel(self)
+        win.title(f"Карточка хоста — {h.get('host','')}")
+        win.configure(bg=BG)
+        win.geometry("760x640")
+        win.minsize(540, 420)
+        try: win.transient(self)
+        except: pass
+
+        tk.Label(win, text=f"  {h.get('host','')} / {h.get('name','')}",
+                 bg=BG, fg=ACC,
+                 font=("Segoe UI", 13, "bold")).pack(fill="x", pady=(10, 2))
+        ttk.Separator(win).pack(fill="x", padx=8, pady=(0,6))
+
+        txt = tk.Text(win, bg=BG, fg=FG, font=("Consolas", 10),
+                      relief="flat", state="normal", wrap="word",
+                      padx=16, pady=10, selectbackground="#313244")
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        txt.tag_configure("hdr",  foreground=ACC, font=("Segoe UI",11,"bold"))
+        txt.tag_configure("key",  foreground="#cba6f7", font=("Consolas",10,"bold"))
+        txt.tag_configure("val",  foreground=FG, font=("Consolas",10))
+        txt.tag_configure("ok",   foreground="#a6e3a1")
+        txt.tag_configure("bad",  foreground="#f38ba8")
+        txt.tag_configure("dim",  foreground="#6c7086")
+
+        def sec(t): txt.insert("end", f"\n● {t}\n", "hdr")
+        def row(k, v, tag="val"):
+            txt.insert("end", f"  {k:<26}", "key")
+            txt.insert("end", f"{v}\n", tag)
+
+        YESNO = lambda v: "Да" if str(v) == "1" else "Нет"
+
+        sec("Основное")
+        row("Host name",    h.get("host",""))
+        row("Visible name", h.get("name","") or h.get("host",""))
+        enabled = str(h.get("status","0")) == "0"
+        row("Enabled", "✅ Включён" if enabled else "❌ Отключён",
+            "ok" if enabled else "bad")
+        row("Monitored by", h.get("_proxy_name","Zabbix Server"))
+        if h.get("description"):
+            row("Description", h["description"][:120])
+        if str(h.get("maintenance_status","0")) == "1":
+            row("Обслуживание",
+                h.get("_maint_name","") or "(без имени)", "ok")
+
+        sec("Host groups")
+        grps = h.get("groups", h.get("hostgroups", []))
+        if grps:
+            for g in grps:
+                txt.insert("end", f"  • {g.get('name','')}\n", "val")
+        else:
+            txt.insert("end", "  (нет)\n", "dim")
+
+        sec("Templates")
+        tpls = h.get("parentTemplates", h.get("_templates", []))
+        if tpls:
+            for tp in tpls:
+                txt.insert("end", f"  • {tp.get('name','?')}\n", "val")
+        else:
+            txt.insert("end", "  (нет шаблонов)\n", "dim")
+
+        sec("Interfaces")
+        ifaces = h.get("interfaces", [])
+        if ifaces:
+            for iface in ifaces:
+                itype = IFACE_TYPE.get(str(iface.get("type","1")), "?")
+                addr  = iface.get("ip","") or iface.get("dns","")
+                port  = iface.get("port","")
+                main  = " [основной]" if iface.get("main") == "1" else ""
+                av    = str(iface.get("available","0"))
+                av_sym = {"0":"?","1":"✓","2":"✗"}.get(av,"?")
+                av_tag = {"0":"dim","1":"ok","2":"bad"}.get(av,"dim")
+                txt.insert("end", f"  • {itype:<6} {addr}:{port}{main}  ", "val")
+                txt.insert("end", f"[{av_sym}]\n", av_tag)
+                if str(iface.get("type","1")) == "1":
+                    av_ver = h.get("_agent_version","")
+                    txt.insert("end", f"    {'Zabbix agent ver':<24}", "key")
+                    txt.insert("end",
+                               f"{av_ver if av_ver else '(не получен)'}\n",
+                               "val" if av_ver else "dim")
+        else:
+            txt.insert("end", "  (нет интерфейсов)\n", "dim")
+
+        sec("Tags")
+        tags = h.get("tags", h.get("_tags", []))
+        if tags:
+            for tg in tags:
+                v = tg.get("value","")
+                txt.insert("end", f"  • {tg.get('tag','')}", "key")
+                txt.insert("end", f"{': ' + v if v else ''}\n", "val")
+        else:
+            txt.insert("end", "  (нет тегов)\n", "dim")
+
+        sec("Host macros")
+        macros = h.get("macros", h.get("_macros", []))
+        if macros:
+            for m in macros:
+                mtype = str(m.get("type","0"))
+                val = "***" if mtype == "1" else m.get("value","")
+                txt.insert("end", f"  {m.get('macro',''):<30}", "key")
+                txt.insert("end", f"= {val}", "val")
+                if m.get("description"):
+                    txt.insert("end", f"   # {m['description'][:40]}", "dim")
+                txt.insert("end", "\n")
+        else:
+            txt.insert("end", "  (нет макросов)\n", "dim")
+
+        txt.configure(state="disabled")
+
+        btn_frm = tk.Frame(win, bg=BG)
+        btn_frm.pack(fill="x", side="bottom", pady=6)
+        ttk.Button(btn_frm, text="Закрыть",
+                   command=win.destroy).pack(side="right", padx=10)
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Вкладка «События» — с фильтрами по серьёзности, хосту, времени
+    # ════════════════════════════════════════════════════════════════════════
+    def _build_events_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#252535"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        tb = tk.Frame(parent, bg=BG2, pady=4)
+        tb.pack(fill="x", padx=4, pady=(4,0))
+
+        # Серьёзность (multi-select через checkboxes)
+        tk.Label(tb, text="Серьёзность:", bg=BG2, fg=ACC,
+                 font=("Segoe UI", 9, "bold")).grid(row=0, column=0, padx=(10,4))
+        self._ev_sev_vars = {}
+        for i, (code, name) in enumerate(SEVERITY_NAMES.items()):
+            v = tk.BooleanVar(value=True)
+            self._ev_sev_vars[code] = v
+            cb = tk.Checkbutton(tb, text=name.split()[0] if " " in name else name,
+                                variable=v,
+                                bg=BG2, fg=FG, selectcolor="#313244",
+                                activebackground=BG2, activeforeground=ACC,
+                                font=("Segoe UI", 8),
+                                command=self._ev_apply_filter)
+            cb.grid(row=0, column=1+i, padx=1)
+
+        # Хост
+        tk.Label(tb, text="Хост:", bg=BG2, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=1, column=0, padx=(10,4), pady=(4,0))
+        self._ev_host_var = tk.StringVar(value="— все —")
+        self._cmb_ev_host = ttk.Combobox(tb, textvariable=self._ev_host_var,
+                                          state="readonly", width=28)
+        self._cmb_ev_host.grid(row=1, column=1, columnspan=3, pady=(4,0), sticky="w")
+        self._cmb_ev_host.bind("<<ComboboxSelected>>",
+                                lambda _: self._ev_apply_filter())
+
+        # Время
+        tk.Label(tb, text="С:", bg=BG2, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=1, column=4, padx=(8,2), pady=(4,0))
+        self._ev_from_var = tk.StringVar()
+        e_from = ttk.Entry(tb, textvariable=self._ev_from_var, width=18)
+        e_from.grid(row=1, column=5, pady=(4,0))
+        tk.Label(tb, text="По:", bg=BG2, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=1, column=6, padx=(6,2), pady=(4,0))
+        self._ev_till_var = tk.StringVar()
+        e_till = ttk.Entry(tb, textvariable=self._ev_till_var, width=18)
+        e_till.grid(row=1, column=7, pady=(4,0))
+
+        ttk.Button(tb, text="🔍 Применить",
+                   command=self._ev_apply_filter).grid(
+                   row=1, column=8, padx=(8,2), pady=(4,0))
+        ttk.Button(tb, text="⟲ Сброс",
+                   command=self._ev_reset_filter).grid(
+                   row=1, column=9, padx=(0,4), pady=(4,0))
+
+        self._ev_status = tk.Label(
+            tb, text="Формат времени: YYYY-MM-DD HH:MM (оставьте пустым — без ограничения)",
+            bg=BG2, fg="#6c7086", font=("Segoe UI", 8))
+        self._ev_status.grid(row=2, column=0, columnspan=10,
+                              padx=10, pady=(2,0), sticky="w")
+
+        # Таблица событий
+        cols = ("ID", "Серьёзность", "Событие", "Хост", "Время", "Восст.", "Длит.")
+        widths = (80, 110, 320, 150, 140, 140, 90)
+        tree_frm = tk.Frame(parent, bg=BG)
+        tree_frm.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._tree_e = ttk.Treeview(tree_frm, columns=cols,
+                                     show="headings", selectmode="browse")
+        for c, w in zip(cols, widths):
+            self._tree_e.heading(c, text=c,
+                command=lambda _c=c, _t=self._tree_e: self._sort(_t, _c))
+            self._tree_e.column(c, width=w, minwidth=40)
+        vs = ttk.Scrollbar(tree_frm, orient="vertical", command=self._tree_e.yview)
+        hs = ttk.Scrollbar(tree_frm, orient="horizontal", command=self._tree_e.xview)
+        self._tree_e.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self._tree_e.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        hs.grid(row=1, column=0, sticky="ew")
+        tree_frm.rowconfigure(0, weight=1); tree_frm.columnconfigure(0, weight=1)
+        self._tree_e._all = []
+
+    def _ev_reset_filter(self):
+        for v in self._ev_sev_vars.values():
+            v.set(True)
+        self._ev_host_var.set("— все —")
+        self._ev_from_var.set("")
+        self._ev_till_var.set("")
+        self._ev_apply_filter()
+
+    def _ev_apply_filter(self):
+        if not self._tree_e._all:
+            return
+        # Серьёзности
+        sev_show = {code for code, v in self._ev_sev_vars.items() if v.get()}
+        host_sel = self._ev_host_var.get()
+        from_ts  = self._parse_dt(self._ev_from_var.get())
+        till_ts  = self._parse_dt(self._ev_till_var.get())
+
+        t = self._tree_e
+        t.delete(*t.get_children())
+        shown = 0
+        for iid, row, e in t._all:
+            sid = str(e.get("severity","0"))
+            if sid not in sev_show:
+                continue
+            if host_sel and host_sel != "— все —":
+                eh = e.get("hosts",[{}])
+                hname = eh[0].get("host","") if eh else ""
+                if hname != host_sel:
+                    continue
+            clk = int(e.get("clock","0") or 0)
+            if from_ts and clk < from_ts:
+                continue
+            if till_ts and clk > till_ts:
+                continue
+            t.insert("", "end", values=row, tags=(f"s{sid}",))
+            t.tag_configure(f"s{sid}",
+                            foreground=SEVERITY_HEX.get(sid,"#cdd6f4"))
+            shown += 1
+        total = len(t._all)
+        self._ev_status.configure(
+            text=f"Показано: {shown} из {total}  "
+                 "|  Формат: YYYY-MM-DD HH:MM")
+
+    def _parse_dt(self, s: str):
+        s = s.strip()
+        if not s:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.datetime.strptime(s, fmt)
+                return int(dt.timestamp())
+            except Exception:
+                continue
+        return None
 
     def _tv(self, parent, cols, widths):
         f = tk.Frame(parent, bg="#1e1e2e")
@@ -3489,7 +4549,16 @@ class App(tk.Tk):
                         "Проверьте права пользователя (нужны Zabbix User+) "
                         "и наличие данных в системе.", "warn"))
 
-                self.after(0, lambda: self._populate(p, h, ev))
+                latest_ok = {}
+                try:
+                    latest_ok = self.zapi.get_hosts_latest_activity(
+                        [hh["hostid"] for hh in h], age_seconds=900)
+                except Exception:
+                    pass
+                def _done(la=latest_ok, pp=p, hh=h, ee=ev):
+                    self._hosts_latest_ok = la
+                    self._populate(pp, hh, ee)
+                self.after(0, _done)
             except Exception as ex:
                 import traceback
                 tb = traceback.format_exc()
@@ -3505,20 +4574,16 @@ class App(tk.Tk):
     def _populate(self, p, h, ev):
         self._problems, self._hosts, self._events = p, h, ev
         self._fill_p(p); self._fill_h(h); self._fill_e(ev); self._fill_sum()
-        # Обновить фильтры вкладки Объекты на основе базовых данных хостов
-        # (полная загрузка по кнопке «Загрузить» во вкладке)
+        # Обновить фильтры объединённой вкладки «Хосты»
         try:
-            fake_groups    = {}
-            fake_templates = {}
+            grps = set()
             for hh in h:
-                # Support both "groups" and "hostgroups" field names
                 grp_list = hh.get("groups", hh.get("hostgroups", []))
                 for g in grp_list:
-                    fake_groups[g["name"]] = g.get("groupid","")
-            self._obj_grp_map = fake_groups
-            self._obj_tpl_map = fake_templates
-            grp_vals = ["— все —"] + sorted(fake_groups.keys())
-            self._cmb_obj_grp["values"] = grp_vals
+                    grps.add(g.get("name",""))
+            grp_vals = ["— все —"] + sorted(x for x in grps if x)
+            if hasattr(self, "_cmb_hosts_grp"):
+                self._cmb_hosts_grp["values"] = grp_vals
         except Exception:
             pass
         self._cmb_hm["values"] = [
@@ -3556,56 +4621,138 @@ class App(tk.Tk):
             t._all.append((iid,row))
 
     def _fill_h(self, data):
-        t = self._tree_h; t.delete(*t.get_children()); t._all = []
-        t.tag_configure("ok",    foreground="#a6e3a1")
-        t.tag_configure("bad",   foreground="#f38ba8")
-        t.tag_configure("unk",   foreground="#f9e2af")
-        t.tag_configure("maint", foreground="#fab387")
+        t = self._tree_h
+        t.delete(*t.get_children())
+        t._all = []
         for h in data:
             ifaces = h.get("interfaces", [])
-            # Доступность вычисляется из интерфейсов (Zabbix 6.0+)
-            avail_str, avail_color, ifaces_str = _iface_avail_str(ifaces)
-            # Для обратной совместимости: если интерфейсов нет — fallback на host.available
-            if not ifaces:
-                ac = str(h.get("available", "0"))
-                avail_str = HOST_AVAIL.get(ac, "Unknown")
-                avail_color = IFACE_AVAIL_COLOR.get(
-                    "1" if ac=="1" else "2" if ac=="2" else "0", "#f9e2af")
-            grps = h.get("groups", h.get("hostgroups", []))
-            # Maintenance
-            in_maint  = h.get("maintenance_status", "0") == "1"
+            # Доступность: используем interface.available + фоллбэк на latest data
+            avail_str = self._compute_host_availability(h)
+
+            # Интерфейсы: «Agent 192.168.1.10:10050  SNMP 10.0.0.5:161»
+            if ifaces:
+                iface_parts = []
+                for iface in ifaces:
+                    typ = IFACE_TYPE.get(str(iface.get("type","1")), "?")
+                    ip  = iface.get("ip","") or iface.get("dns","")
+                    port = iface.get("port","")
+                    main = " ●" if str(iface.get("main","0")) == "1" else ""
+                    iface_parts.append(f"{typ} {ip}:{port}{main}")
+                ifaces_str = "  ".join(iface_parts)
+            else:
+                ifaces_str = "—"
+
+            # Группы и шаблоны
+            grps_list = h.get("groups", h.get("hostgroups", []))
+            grps_str  = ", ".join(g.get("name","") for g in grps_list)
+            tpls_list = h.get("_templates", h.get("parentTemplates", []))
+            tpls_str  = ", ".join(tp.get("name","") for tp in tpls_list)
+
+            # Agent version
+            agent_ver = h.get("_agent_version","") or ""
+
+            in_maint  = str(h.get("maintenance_status","0")) == "1"
             maint_str = ""
             if in_maint:
-                mname     = h.get("_maint_name", "")
+                mname     = h.get("_maint_name","")
                 maint_str = f"🔧 {mname}" if mname else "🔧 Обслуживание"
 
             row = (h.get("host",""), h.get("name",""),
-                   ", ".join(g["name"] for g in grps),
+                   grps_str, tpls_str,
                    HOST_STATUS.get(str(h.get("status","0")),""),
                    avail_str,
                    ifaces_str,
+                   agent_ver,
                    h.get("triggers","0"),
                    maint_str)
 
             tag = ("maint" if in_maint else
                    "ok"    if avail_str == "Available" else
                    "bad"   if avail_str == "Unavailable" else "unk")
-            iid = t.insert("","end", values=row, tags=(tag,))
-            t._all.append((iid, row))
+            iid = t.insert("","end", values=row, tags=(tag,), iid=h["hostid"])
+            t._all.append((iid, row, h))
+
+    def _compute_host_availability(self, h):
+        """
+        Вычисляет статус доступности хоста:
+        1) Для Agent — использует interface.available
+        2) Для SNMP/IPMI/JMX — если interface.available Unknown,
+           проверяет «latest data» (кеш self._hosts_latest_ok)
+        Возвращает: "Available" / "Unavailable" / "Unknown"
+        """
+        ifaces = h.get("interfaces", [])
+        if not ifaces:
+            # Fallback на устаревшее host.available
+            return HOST_AVAIL.get(str(h.get("available","0")), "Unknown")
+
+        has_unavail = False
+        has_avail   = False
+        has_unknown = False
+        for iface in ifaces:
+            av    = str(iface.get("available","0"))
+            itype = str(iface.get("type","1"))
+            if av == "1":
+                has_avail = True
+            elif av == "2":
+                has_unavail = True
+            else:
+                # Unknown — для не-Agent проверяем latest data
+                if itype != "1" and self._hosts_latest_ok.get(h["hostid"]):
+                    has_avail = True
+                else:
+                    has_unknown = True
+
+        if has_unavail:
+            return "Unavailable"
+        if has_avail:
+            return "Available"
+        return "Unknown"
 
     def _fill_e(self, data):
-        t = self._tree_e; t.delete(*t.get_children()); t._all = []
+        t = self._tree_e
+        t.delete(*t.get_children())
+        t._all = []
+        # Собрать уникальные хосты для combobox
+        hosts_set = set()
         for e in data:
-            sid = str(e.get("severity","0")); rc = e.get("r_clock","0")
-            eh  = e.get("hosts",[{}])
-            row = (e.get("eventid",""), SEVERITY_NAMES.get(sid,sid),
+            eh = e.get("hosts",[])
+            if eh:
+                hosts_set.add(eh[0].get("host",""))
+        host_list = ["— все —"] + sorted(h for h in hosts_set if h)
+        try:
+            self._cmb_ev_host["values"] = host_list
+            if self._ev_host_var.get() not in host_list:
+                self._ev_host_var.set("— все —")
+        except Exception:
+            pass
+
+        for e in data:
+            sid = str(e.get("severity","0"))
+            rc  = e.get("r_clock","0") or "0"
+            eh  = e.get("hosts",[])
+            hname = eh[0].get("host","") if eh else ""
+            clk = int(e.get("clock","0") or 0)
+            # Длительность
+            if rc and rc != "0":
+                dur = dur_str_from(clk, int(rc))
+            else:
+                dur = dur_str(clk)  # от clock до now
+            row = (e.get("eventid",""),
+                   SEVERITY_NAMES.get(sid, sid),
                    e.get("name",""),
-                   eh[0].get("host","") if eh else "",
-                   ts2str(e.get("clock",0)),
-                   ts2str(rc) if rc not in ("","0") else "–")
-            iid = t.insert("","end",values=row,tags=(f"s{sid}",))
-            t.tag_configure(f"s{sid}", foreground=SEVERITY_HEX.get(sid,"#cdd6f4"))
-            t._all.append((iid,row))
+                   hname,
+                   ts2str(clk),
+                   ts2str(rc) if rc not in ("","0") else "—",
+                   dur)
+            iid = t.insert("","end", values=row, tags=(f"s{sid}",))
+            t.tag_configure(f"s{sid}",
+                            foreground=SEVERITY_HEX.get(sid,"#cdd6f4"))
+            t._all.append((iid, row, e))
+        # Применить фильтры (если они настроены)
+        try:
+            self._ev_apply_filter()
+        except Exception:
+            pass
 
     def _fill_sum(self):
         p, h, ev = self._problems, self._hosts, self._events
