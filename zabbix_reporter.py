@@ -1,5 +1,5 @@
 """
-Zabbix Reporter v3.0  —  Windows 10/11
+Zabbix Reporter v3.4  —  Windows 10/11
 Получение репортов из Zabbix 7.x через JSON-RPC API
 Экспорт: PDF, Excel (.xlsx), CSV
 Данные: Проблемы/Алерты, Графики метрик, Статус хостов, История событий
@@ -12,6 +12,7 @@ import urllib.request
 import urllib.error
 import csv
 import os
+import sys
 import threading
 import datetime
 import ssl
@@ -402,7 +403,7 @@ def _compare_to_pdf(path: str, result: dict):
         w,h = landscape(A4)
         cv.setFillColor(HexColor("#0F3460")); cv.rect(0,h-16*mm,w,16*mm,fill=1,stroke=0)
         cv.setFillColor(colors.white); cv.setFont(_PDF_FONT_BOLD,10)
-        cv.drawString(12*mm,h-10*mm,"Zabbix Reporter v3.0 — Сравнение шаблонов")
+        cv.drawString(12*mm,h-10*mm,"Zabbix Reporter v3.4 — Сравнение шаблонов")
         cv.setFont(_PDF_FONT,8)
         cv.drawRightString(w-12*mm,h-10*mm,datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         cv.setFillColor(HexColor("#0F3460")); cv.rect(0,0,w,8*mm,fill=1,stroke=0)
@@ -628,7 +629,7 @@ def _auth_to_pdf(path: str, auth_data: dict, user_dirs: list):
         canvas.rect(0, h-18*mm, w, 18*mm, fill=1, stroke=0)
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT_BOLD, 10)
-        canvas.drawString(15*mm, h-11*mm, "Zabbix Reporter v3.0 — Аутентификация")
+        canvas.drawString(15*mm, h-11*mm, "Zabbix Reporter v3.4 — Аутентификация")
         canvas.setFont(_PDF_FONT, 8)
         canvas.drawRightString(w-15*mm, h-11*mm,
                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -637,7 +638,7 @@ def _auth_to_pdf(path: str, auth_data: dict, user_dirs: list):
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT, 7)
         canvas.drawCentredString(w/2, 3*mm,
-                                 f"Страница {doc.page}  |  Zabbix Reporter v3.0")
+                                 f"Страница {doc.page}  |  Zabbix Reporter v3.4")
         canvas.restoreState()
 
     doc.build(st, onFirstPage=_on_page, onLaterPages=_on_page)
@@ -826,7 +827,7 @@ def _dupes_to_pdf(path: str, groups: list, total_hosts: int):
         canvas.rect(0, h-18*mm, w, 18*mm, fill=1, stroke=0)
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT_BOLD, 10)
-        canvas.drawString(14*mm, h-11*mm, "Zabbix Reporter v3.0 — Дубликаты хостов")
+        canvas.drawString(14*mm, h-11*mm, "Zabbix Reporter v3.4 — Дубликаты хостов")
         canvas.setFont(_PDF_FONT, 8)
         canvas.drawRightString(w-14*mm, h-11*mm,
                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -835,7 +836,7 @@ def _dupes_to_pdf(path: str, groups: list, total_hosts: int):
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT, 7)
         canvas.drawCentredString(w/2, 3*mm,
-                                 f"Страница {doc.page}  |  Zabbix Reporter v3.0")
+                                 f"Страница {doc.page}  |  Zabbix Reporter v3.4")
         canvas.restoreState()
 
     doc.build(st, onFirstPage=_on_page, onLaterPages=_on_page)
@@ -1629,7 +1630,7 @@ class PDFReporter:
         canvas.rect(0, h - 22*mm, w, 22*mm, fill=1, stroke=0)
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT_BOLD, 11)
-        canvas.drawString(15*mm, h - 14*mm, "ZABBIX REPORTER v3.0")
+        canvas.drawString(15*mm, h - 14*mm, "ZABBIX REPORTER v3.4")
         canvas.setFont(_PDF_FONT, 9)
         canvas.drawRightString(w - 15*mm, h - 14*mm,
                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -1638,7 +1639,7 @@ class PDFReporter:
         canvas.setFillColor(colors.white)
         canvas.setFont(_PDF_FONT, 8)
         canvas.drawCentredString(w/2, 3.5*mm,
-                                 f"Страница {doc.page}  |  Zabbix Reporter v3.0")
+                                 f"Страница {doc.page}  |  Zabbix Reporter v3.4")
         canvas.restoreState()
 
     def build(self, problems, hosts, events, metrics=None, sections=None, hosts_detail=None, auth_data=None, user_dirs=None):
@@ -2269,23 +2270,131 @@ class ExcelReporter:
 #  GUI — Главное окно
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
-#  Конфиг (config.json рядом со скриптом)
+#  Конфиг (config.json рядом со скриптом/EXE)
 # ══════════════════════════════════════════════════════════════════════════════
-_CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+import hashlib as _hashlib
+import base64  as _base64
+
+def _get_app_dir() -> str:
+    """
+    Возвращает директорию приложения — работает одинаково для:
+      - python zabbix_reporter.py  → папка .py файла
+      - PyInstaller onefile .exe   → папка .exe файла (не temp _MEI)
+      - PyInstaller onedir .exe    → папка .exe файла
+    """
+    if getattr(sys, "frozen", False):
+        # Собрано PyInstaller — берём папку рядом с EXE
+        return os.path.dirname(os.path.abspath(sys.executable))
+    # Обычный запуск .py — берём папку скрипта
+    return os.path.dirname(os.path.abspath(__file__))
+
+_CFG_DIR  = _get_app_dir()
+_CFG_FILE = os.path.join(_CFG_DIR, "config.json")
+
+
+def _get_machine_key() -> bytes:
+    """
+    Получает машинно-зависимый ключ для шифрования.
+    Используются стабильные идентификаторы Windows:
+      - MachineGuid из реестра, либо
+      - ComputerName + имя пользователя (фоллбэк).
+    Пароль, зашифрованный на одной машине, не расшифровать на другой.
+    """
+    seed_parts = []
+    try:
+        if sys.platform == "win32":
+            import winreg
+            # MachineGuid — уникальный для каждой установки Windows
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                     r"SOFTWARE\Microsoft\Cryptography",
+                                     0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+                    guid, _ = winreg.QueryValueEx(k, "MachineGuid")
+                    seed_parts.append(guid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Фоллбэки
+    seed_parts.append(os.environ.get("COMPUTERNAME", "") or os.uname().nodename
+                      if hasattr(os, "uname") else "")
+    seed_parts.append(os.environ.get("USERNAME", "")
+                      or os.environ.get("USER", ""))
+    # Fixed salt чтобы ключ был детерминирован между запусками
+    seed_parts.append("ZabbixReporter_v3_salt_7f3a9c1e")
+
+    seed = "|".join(str(p) for p in seed_parts if p).encode("utf-8")
+    return _hashlib.sha256(seed).digest()   # 32 байта
+
+
+def _encrypt_password(plain: str) -> str:
+    """
+    Шифрует пароль XOR + base64 с машинно-зависимым ключом.
+    Не криптостойко против целевой атаки, но защищает от случайного
+    просмотра config.json и от копирования файла на другой ПК.
+    """
+    if not plain:
+        return ""
+    key  = _get_machine_key()
+    data = plain.encode("utf-8")
+    # XOR с растянутым ключом
+    xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    return "enc:" + _base64.b64encode(xored).decode("ascii")
+
+
+def _decrypt_password(stored: str) -> str:
+    """Расшифровывает пароль. Если нет префикса 'enc:' — возвращает строку как есть
+    (обратная совместимость со старыми plaintext-конфигами)."""
+    if not stored:
+        return ""
+    if not stored.startswith("enc:"):
+        # Старый формат — пароль в открытом виде. Возвращаем,
+        # при следующем сохранении зашифруется автоматически.
+        return stored
+    try:
+        payload = stored[4:]
+        xored   = _base64.b64decode(payload)
+        key     = _get_machine_key()
+        data    = bytes(b ^ key[i % len(key)] for i, b in enumerate(xored))
+        return data.decode("utf-8")
+    except Exception:
+        # Расшифровка не удалась (например, конфиг с другой машины) —
+        # возвращаем пустую строку, пользователь введёт заново
+        return ""
+
 
 def _cfg_load() -> dict:
     try:
         with open(_CFG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Расшифровать пароль при загрузке
+        if "password" in data and data.get("password"):
+            data["password"] = _decrypt_password(data["password"])
+        return data
     except Exception:
         return {}
 
+
 def _cfg_save(data: dict) -> None:
     try:
+        # Копия без изменения оригинала — шифруем пароль в копии
+        out = dict(data)
+        if out.get("password"):
+            out["password"] = _encrypt_password(out["password"])
+        # Убедиться что директория существует (для onefile exe)
+        try:
+            os.makedirs(_CFG_DIR, exist_ok=True)
+        except Exception:
+            pass
         with open(_CFG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+            json.dump(out, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Критическая ошибка сохранения — вывести в stderr
+        try:
+            sys.stderr.write(f"[config] save failed: {e}\n")
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2449,7 +2558,7 @@ class LogWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("⚡ Zabbix Reporter v3.0")
+        self.title("⚡ Zabbix Reporter v3.4")
         self.geometry("1540x860")
         self.minsize(1200, 700)
         self.configure(bg="#1e1e2e")
@@ -2528,7 +2637,7 @@ class App(tk.Tk):
     def _build_ui(self):
         hdr = tk.Frame(self, bg="#181825", height=52)
         hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.0",
+        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.4",
                  bg="#181825", fg="#89b4fa",
                  font=("Segoe UI",17,"bold")).pack(side="left", padx=18, pady=10)
         self._lbl_ver  = tk.Label(hdr, text="", bg="#181825",
@@ -4760,7 +4869,7 @@ class App(tk.Tk):
         for x in p: sc[str(x.get("severity","0"))] = sc.get(str(x.get("severity","0")),0)+1
         av = {"Available":0,"Unavailable":0,"Unknown":0}
         for x in h: av[HOST_AVAIL.get(str(x.get("available","0")),"Unknown")] += 1
-        lines = ["═"*62,"  СВОДНЫЙ ОТЧЁТ — Zabbix Reporter v3.0",
+        lines = ["═"*62,"  СВОДНЫЙ ОТЧЁТ — Zabbix Reporter v3.4",
                  f"  {datetime.datetime.now():%Y-%m-%d %H:%M:%S}","═"*62,"",
                  f"  ПРОБЛЕМЫ (всего: {len(p)})", "  "+"-"*44]
         for k, n in SEVERITY_NAMES.items():
@@ -5135,8 +5244,8 @@ class App(tk.Tk):
             self._e_till.delete(0,"end"); self._e_till.insert(0, c["date_till"])
 
     def _cfg_save_ui(self):
-        """Сохранить текущие настройки в config.json."""
-        _cfg_save({
+        """Сохранить текущие настройки в config.json (рядом с .py или .exe)."""
+        data = {
             "url":        self._e_url.get().strip(),
             "user":       self._e_user.get().strip(),
             "password":   self._e_pass.get(),
@@ -5145,8 +5254,15 @@ class App(tk.Tk):
             "limit":      self._v_limit.get(),
             "date_from":  self._e_from.get().strip(),
             "date_till":  self._e_till.get().strip(),
-        })
-        self._info("Настройки сохранены в config.json")
+        }
+        # Сохранить пользовательский выбор разделов экспорта, если был задан
+        if "report_sections" in self._cfg:
+            data["report_sections"] = self._cfg["report_sections"]
+        _cfg_save(data)
+        # Обновляем кешированный конфиг в памяти
+        self._cfg.update(data)
+        self._info(f"Настройки сохранены: {_CFG_FILE}")
+        self.log(f"✓ Config saved: {_CFG_FILE}  (password encrypted)", "ok")
 
     def _on_close(self):
         self._cfg_save_ui()
