@@ -1,5 +1,5 @@
 """
-Zabbix Reporter v3.4  —  Windows 10/11
+Zabbix Reporter v3.4.2  —  Windows 10/11
 Получение репортов из Zabbix 7.x через JSON-RPC API
 Экспорт: PDF, Excel (.xlsx), CSV
 Данные: Проблемы/Алерты, Графики метрик, Статус хостов, История событий
@@ -1367,6 +1367,44 @@ class ZabbixAPI:
             "limit": limit,
         })
 
+    def get_hosts_latest_activity(self, host_ids, age_seconds: int = 900) -> dict:
+        """
+        Возвращает {hostid: True/False} — True если на хосте есть
+        хотя бы один монитор-айтем со свежими данными (lastclock > now - age_seconds).
+        Используется как доп. сигнал доступности для не-Agent интерфейсов
+        (SNMP/IPMI/JMX), у которых interface.available может быть Unknown,
+        но фактически данные приходят.
+        """
+        result = {hid: False for hid in (host_ids or [])}
+        if not host_ids:
+            return result
+        try:
+            now = int(datetime.datetime.now().timestamp())
+            cutoff = now - max(60, int(age_seconds))
+            # Получаем только lastclock для монитор-айтемов запрошенных хостов
+            items = self._call("item.get", {
+                "output":   ["itemid", "hostid", "lastclock"],
+                "hostids":  list(host_ids),
+                "monitored": True,
+                "filter":   {"status": "0"},   # включённые
+            })
+            for it in items or []:
+                hid = it.get("hostid")
+                lc  = it.get("lastclock")
+                if not hid or not lc:
+                    continue
+                try:
+                    lc_int = int(lc)
+                except (TypeError, ValueError):
+                    continue
+                if lc_int >= cutoff:
+                    result[hid] = True
+        except Exception:
+            # При любой ошибке возвращаем словарь со значениями False —
+            # потребитель должен корректно работать с пустым результатом
+            pass
+        return result
+
     def get_template_full(self, templateid: str) -> dict:
         """Полные данные шаблона: items, triggers, discovery rules с прототипами."""
         # Items
@@ -2458,13 +2496,60 @@ class LogWindow(tk.Toplevel):
         # Текстовое поле
         frm = tk.Frame(self, bg="#11111b")
         frm.pack(fill="both", expand=True, padx=4, pady=4)
+        # state="normal" + блокировка ввода через bind — позволяет выделять
+        # текст и копировать его (Ctrl+C / Ctrl+A) штатными средствами Tk
         self._txt = tk.Text(
             frm, bg="#11111b", fg="#a6adc8",
             font=("Consolas", 10), relief="flat",
-            state="disabled", wrap="none",
+            state="normal", wrap="none",
             padx=10, pady=6,
             selectbackground="#313244",
+            insertofftime=600, insertontime=0,   # каретка не моргает
         )
+        # Блокируем редактирование, но НЕ блокируем выделение/копирование.
+        # Разрешённые ключи: навигация, Ctrl+C, Ctrl+A, Ctrl+Insert.
+        def _readonly_keypress(event):
+            ks = event.keysym
+            ctrl = (event.state & 0x4) != 0
+            allowed_nav = {
+                "Left", "Right", "Up", "Down",
+                "Home", "End", "Prior", "Next",
+                "Shift_L", "Shift_R", "Control_L", "Control_R",
+                "Alt_L", "Alt_R",
+            }
+            if ks in allowed_nav:
+                return  # разрешаем навигацию
+            if ctrl and ks.lower() in ("c", "a", "insert"):
+                return  # разрешаем копирование / select-all
+            return "break"  # блокируем всё остальное (ввод/удаление)
+        self._txt.bind("<Key>", _readonly_keypress)
+        # Контекстное меню для копирования
+        def _copy_sel():
+            try:
+                sel = self._txt.selection_get()
+            except tk.TclError:
+                return
+            self.clipboard_clear()
+            self.clipboard_append(sel)
+        def _select_all():
+            self._txt.tag_add("sel", "1.0", "end-1c")
+            return "break"
+        self._txt.bind("<Control-c>", lambda _e: (_copy_sel(), "break")[1])
+        self._txt.bind("<Control-C>", lambda _e: (_copy_sel(), "break")[1])
+        self._txt.bind("<Control-Insert>", lambda _e: (_copy_sel(), "break")[1])
+        self._txt.bind("<Control-a>", lambda _e: _select_all())
+        self._txt.bind("<Control-A>", lambda _e: _select_all())
+        # Контекстное меню (правая кнопка)
+        ctx = tk.Menu(self._txt, tearoff=0,
+                      bg="#1e1e2e", fg="#cdd6f4",
+                      activebackground="#313244", activeforeground="#cdd6f4")
+        ctx.add_command(label="Копировать (Ctrl+C)", command=_copy_sel)
+        ctx.add_command(label="Выделить всё (Ctrl+A)", command=_select_all)
+        def _show_ctx(event):
+            try: ctx.tk_popup(event.x_root, event.y_root)
+            finally: ctx.grab_release()
+        self._txt.bind("<Button-3>", _show_ctx)
+
         vs = ttk.Scrollbar(frm, orient="vertical",   command=self._txt.yview)
         hs = ttk.Scrollbar(frm, orient="horizontal", command=self._txt.xview)
         self._txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -2486,7 +2571,6 @@ class LogWindow(tk.Toplevel):
 
     def _load_history(self):
         buf = self._master._log_buf
-        self._txt.configure(state="normal")
         raw = buf.get("1.0", "end")
         self._txt.insert("end", raw)
         for tag in self.TAG_COLORS:
@@ -2496,23 +2580,18 @@ class LogWindow(tk.Toplevel):
                 except: pass
         self._line_count = max(0, int(self._txt.index("end-1c").split(".")[0]) - 1)
         self._txt.see("end")
-        self._txt.configure(state="disabled")
         self._upd_sb()
 
     def append(self, text: str, tag: str = "info"):
-        self._txt.configure(state="normal")
         self._txt.insert("end", text, tag)
         if text.endswith("\n"):
             self._line_count += 1
         self._txt.see("end")
-        self._txt.configure(state="disabled")
         self._upd_sb()
 
     def clear(self):
         self._master._log_buf.delete("1.0", "end")
-        self._txt.configure(state="normal")
         self._txt.delete("1.0", "end")
-        self._txt.configure(state="disabled")
         self._line_count = 0
         self._upd_sb()
 
@@ -2520,22 +2599,61 @@ class LogWindow(tk.Toplevel):
         lvl = self._flt.get()
         q   = self._srch.get().lower()
         buf = self._master._log_buf
+
+        # ── Построим карту: line_no -> set(tag) — какие уровневые теги
+        # ── (req/ok/err/warn/info) применены хотя бы к одному символу
+        # ── строки. На основе этого фильтруем по уровню.
+        level_tags = ("err", "warn", "ok", "req", "info")
+        line_tags: dict = {}   # line_no(int) -> set of tag-names
+        for tag in level_tags:
+            try:
+                ranges = buf.tag_ranges(tag)
+            except Exception:
+                continue
+            for i in range(0, len(ranges), 2):
+                try:
+                    start = str(ranges[i])
+                    end   = str(ranges[i+1])
+                    s_line = int(start.split(".")[0])
+                    e_line = int(end.split(".")[0])
+                    # Если конец на колонке 0 — он не затрагивает эту строку
+                    e_col  = int(end.split(".")[1])
+                    if e_col == 0 and e_line > s_line:
+                        e_line -= 1
+                    for ln in range(s_line, e_line + 1):
+                        line_tags.setdefault(ln, set()).add(tag)
+                except Exception:
+                    continue
+
         lines = buf.get("1.0", "end").splitlines()
-        self._txt.configure(state="normal")
+        # Очищаем окно (виджет state="normal", редактирование заблокировано
+        # через bind, но программная очистка работает).
         self._txt.delete("1.0", "end")
         shown = 0
-        for line in lines:
-            if not line: continue
-            if q and q not in line.lower(): continue
-            self._txt.insert("end", line + "\n")
+        for idx, line in enumerate(lines, start=1):
+            if not line:
+                continue
+            # Фильтр по уровню
+            if lvl and lvl != "все":
+                tags_here = line_tags.get(idx, set())
+                if lvl not in tags_here:
+                    continue
+            # Поиск по подстроке
+            if q and q not in line.lower():
+                continue
+            # Определяем основной тег для подсветки
+            tags_here = line_tags.get(idx, set())
+            primary = None
+            for cand in ("err", "warn", "ok", "req", "info"):
+                if cand in tags_here:
+                    primary = cand
+                    break
+            if primary:
+                self._txt.insert("end", line + "\n", primary)
+            else:
+                self._txt.insert("end", line + "\n")
             shown += 1
-        for tag in self.TAG_COLORS:
-            ranges = buf.tag_ranges(tag)
-            for i in range(0, len(ranges), 2):
-                try: self._txt.tag_add(tag, str(ranges[i]), str(ranges[i+1]))
-                except: pass
         self._txt.see("end")
-        self._txt.configure(state="disabled")
         self._cnt_lbl.configure(text=f"{shown} строк")
 
     def _save(self):
@@ -2558,7 +2676,7 @@ class LogWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("⚡ Zabbix Reporter v3.4")
+        self.title("⚡ Zabbix Reporter v3.4.2")
         self.geometry("1540x860")
         self.minsize(1200, 700)
         self.configure(bg="#1e1e2e")
@@ -2637,7 +2755,7 @@ class App(tk.Tk):
     def _build_ui(self):
         hdr = tk.Frame(self, bg="#181825", height=52)
         hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.4",
+        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.4.2",
                  bg="#181825", fg="#89b4fa",
                  font=("Segoe UI",17,"bold")).pack(side="left", padx=18, pady=10)
         self._lbl_ver  = tk.Label(hdr, text="", bg="#181825",
@@ -4028,9 +4146,7 @@ class App(tk.Tk):
         nb = ttk.Notebook(parent); nb.pack(fill="both", expand=True)
 
         t1 = ttk.Frame(nb); nb.add(t1, text=" 🔴 Проблемы ")
-        self._tree_p = self._tv(t1,
-            ("Серьёзность","Проблема","Хост","Начало","Длит.","Подтв."),
-            (118,360,160,152,108,68))
+        self._build_problems_tab(t1)
 
         t2 = ttk.Frame(nb); nb.add(t2, text=" 🖥 Хосты ")
         self._build_hosts_tab(t2)
@@ -4044,13 +4160,13 @@ class App(tk.Tk):
         t7 = ttk.Frame(nb); nb.add(t7, text=" 🔐 Аутентификация ")
         self._build_auth_tab(t7)
 
-        t8 = ttk.Frame(nb); nb.add(t8, text=" ⚖ Сравнение ")
+        t8 = ttk.Frame(nb); nb.add(t8, text=" ⚖ Сравнение шаблонов ")
         self._build_compare_tab(t8)
 
         t9  = ttk.Frame(nb); nb.add(t9,  text=" 📤 Экспорт шаблонов ")
         self._build_tpl_export_tab(t9)
 
-        t10 = ttk.Frame(nb); nb.add(t10, text=" 🔎 Дубликаты ")
+        t10 = ttk.Frame(nb); nb.add(t10, text=" 🔎 Дубликаты хостов ")
         self._build_dupes_tab(t10)
 
         t5  = ttk.Frame(nb); nb.add(t5,  text=" 📊 Сводка ")
@@ -4062,6 +4178,207 @@ class App(tk.Tk):
         self._sum_txt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Вкладка «Проблемы» — список с кнопкой загрузки и карточкой по dbl-click
+    # ════════════════════════════════════════════════════════════════════════
+    def _build_problems_tab(self, parent):
+        BG = "#1e1e2e"; BG2 = "#252535"; FG = "#cdd6f4"; ACC = "#89b4fa"
+
+        # Toolbar: кнопка загрузки + статус
+        tb = tk.Frame(parent, bg=BG2, pady=4)
+        tb.pack(fill="x", padx=4, pady=(4, 0))
+
+        ttk.Button(tb, text="🔄 Загрузить",
+                   command=self._problems_load).grid(row=0, column=0, padx=(10, 6))
+
+        self._problems_status = tk.Label(
+            tb, text="Нажмите «Загрузить» для получения списка проблем. "
+                    "Двойной клик по строке — открыть карточку.",
+            bg=BG2, fg="#6c7086", font=("Segoe UI", 8))
+        self._problems_status.grid(row=0, column=1, padx=10, sticky="w")
+
+        # Дерево (с поиском через _tv)
+        self._tree_p = self._tv(parent,
+            ("Серьёзность", "Проблема", "Хост", "Начало", "Длит.", "Подтв."),
+            (118, 360, 160, 152, 108, 68))
+
+        # Двойной клик / Enter → карточка проблемы
+        self._tree_p.bind("<Double-1>", self._problems_open_card)
+        self._tree_p.bind("<Return>",   self._problems_open_card)
+
+    def _problems_load(self):
+        """Загружает проблемы по фильтрам из левой панели (severity/limit)."""
+        if not self.zapi:
+            messagebox.showwarning("", "Сначала подключитесь к Zabbix"); return
+        self._busy(True)
+        self._problems_status.configure(text="Загрузка проблем…")
+        try:
+            sev   = int(self._cmb_sev.get().split()[0])
+            limit = int(self._v_limit.get() or 500)
+        except Exception:
+            sev, limit = 0, 500
+
+        self.log(f"━━━ [Problems] problem.get sev>={sev} limit={limit} ━━━", "info")
+        def _w():
+            try:
+                p = self.zapi.get_problems(sev_min=sev, limit=limit)
+                def _done(pp=p):
+                    self._problems = pp
+                    self._fill_p(pp)
+                    self._busy(False)
+                    self._problems_status.configure(
+                        text=f"Загружено: {len(pp)} проблем  |  "
+                             "Двойной клик — открыть карточку")
+                    self.log(f"  [Problems] получено: {len(pp)}", "ok")
+                    # Обновляем сводку, если есть
+                    try: self._fill_sum()
+                    except Exception: pass
+                self.after(0, _done)
+            except Exception as ex:
+                msg = f"Ошибка: {ex}"
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._problems_status.configure(text=m),
+                    self.log(f"  [Problems] {m}", "err")))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _problems_open_card(self, event=None):
+        """Открыть окно с карточкой выбранной проблемы."""
+        sel = self._tree_p.selection()
+        if not sel:
+            return
+        # Берём значения строки напрямую из treeview — устойчиво к
+        # переиндексации iid после фильтрации поиском.
+        try:
+            vals = self._tree_p.item(sel[0], "values")
+        except Exception:
+            return
+        if not vals or len(vals) < 4:
+            return
+        name_v, host_v, time_v = vals[1], vals[2], vals[3]
+        problem = None
+        for p in (self._problems or []):
+            hn = (p.get("hosts", [{}])[0].get("host", "")
+                  if p.get("hosts") else "")
+            if (p.get("name", "") == name_v
+                    and hn == host_v
+                    and ts2str(p.get("clock", 0)) == time_v):
+                problem = p
+                break
+        if problem is None:
+            return
+        self._open_problem_card_window(problem)
+
+    def _open_problem_card_window(self, p):
+        """Модальное окно с детальной информацией о проблеме."""
+        BG = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+        win = tk.Toplevel(self)
+        win.title(f"Карточка проблемы — {p.get('eventid','')}")
+        win.configure(bg=BG)
+        win.geometry("760x600")
+        win.minsize(520, 380)
+        try: win.transient(self)
+        except: pass
+
+        sid = str(p.get("severity", "0"))
+        sev_name = SEVERITY_NAMES.get(sid, sid)
+        sev_color = SEVERITY_HEX.get(sid, "#cdd6f4")
+
+        tk.Label(win, text=f"  {p.get('name','(без имени)')}",
+                 bg=BG, fg=ACC, wraplength=720, justify="left",
+                 font=("Segoe UI", 13, "bold")).pack(fill="x", pady=(10, 2))
+        tk.Label(win, text=f"  Серьёзность: {sev_name}",
+                 bg=BG, fg=sev_color,
+                 font=("Segoe UI", 10, "bold")).pack(fill="x", pady=(0, 4))
+        ttk.Separator(win).pack(fill="x", padx=8, pady=(0, 6))
+
+        txt = tk.Text(win, bg=BG, fg=FG, font=("Consolas", 10),
+                      relief="flat", state="normal", wrap="word",
+                      padx=16, pady=10, selectbackground="#313244")
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        txt.tag_configure("hdr", foreground=ACC, font=("Segoe UI", 11, "bold"))
+        txt.tag_configure("key", foreground="#cba6f7", font=("Consolas", 10, "bold"))
+        txt.tag_configure("val", foreground=FG, font=("Consolas", 10))
+        txt.tag_configure("ok",  foreground="#a6e3a1")
+        txt.tag_configure("bad", foreground="#f38ba8")
+        txt.tag_configure("dim", foreground="#6c7086")
+
+        def sec(t): txt.insert("end", f"\n● {t}\n", "hdr")
+        def row(k, v, tag="val"):
+            txt.insert("end", f"  {k:<24}", "key")
+            txt.insert("end", f"{v}\n", tag)
+
+        sec("Основное")
+        row("Event ID",     p.get("eventid", "—"))
+        row("Object ID",    p.get("objectid", "—"))
+        row("Серьёзность",  sev_name)
+        row("Имя проблемы", p.get("name", ""))
+        clk = int(p.get("clock", 0) or 0)
+        row("Начало",       ts2str(clk) if clk else "—")
+        row("Длительность", dur_str(clk) if clk else "—")
+        rec = p.get("r_clock", "0") or "0"
+        if rec and rec != "0":
+            row("Восстановлено", ts2str(rec), "ok")
+        else:
+            row("Восстановлено", "Активна", "bad")
+
+        sec("Хост")
+        hl = p.get("hosts", [])
+        if hl:
+            for h in hl:
+                row("host",   h.get("host", ""))
+                row("name",   h.get("name", "") or h.get("host", ""))
+                if h.get("hostid"):
+                    row("hostid", h.get("hostid", ""))
+        else:
+            txt.insert("end", "  (нет данных по хосту)\n", "dim")
+
+        sec("Подтверждения")
+        acks = p.get("acknowledges", []) or []
+        if acks:
+            row("Кол-во", len(acks))
+            for i, a in enumerate(acks[:10], 1):
+                ack_clk = int(a.get("clock", 0) or 0)
+                msg = a.get("message", "") or ""
+                txt.insert("end",
+                    f"  {i}. {ts2str(ack_clk) if ack_clk else '—'}  "
+                    f"user={a.get('userid','?')}\n", "val")
+                if msg:
+                    txt.insert("end", f"     {msg}\n", "dim")
+            if len(acks) > 10:
+                txt.insert("end", f"  … ещё {len(acks)-10}\n", "dim")
+        else:
+            txt.insert("end", "  Нет\n", "dim")
+
+        sec("Теги")
+        tags = p.get("tags", []) or []
+        if tags:
+            for tg in tags:
+                v = tg.get("value", "")
+                txt.insert("end", f"  • {tg.get('tag','')}", "key")
+                txt.insert("end", f"{': ' + v if v else ''}\n", "val")
+        else:
+            txt.insert("end", "  (нет тегов)\n", "dim")
+
+        # Дополнительные поля «как есть» — комментарий, severity-detail и т.п.
+        sec("Дополнительно")
+        for fld in ("opdata", "comments", "url", "correlationid",
+                    "userid", "suppressed", "cause_eventid"):
+            v = p.get(fld)
+            if v not in (None, "", "0"):
+                row(fld, str(v))
+
+        txt.configure(state="disabled")
+
+        btn_frm = tk.Frame(win, bg=BG)
+        btn_frm.pack(fill="x", side="bottom", pady=6)
+        ttk.Button(btn_frm, text="Закрыть",
+                   command=win.destroy).pack(side="right", padx=10)
 
     # ════════════════════════════════════════════════════════════════════════
     #  Вкладка «Хосты» — объединяет список и детальную карточку
@@ -4430,11 +4747,16 @@ class App(tk.Tk):
         ttk.Button(tb, text="⟲ Сброс",
                    command=self._ev_reset_filter).grid(
                    row=1, column=9, padx=(0,4), pady=(4,0))
+        ttk.Button(tb, text="🔄 Загрузить",
+                   command=self._events_load).grid(
+                   row=1, column=10, padx=(8,4), pady=(4,0))
 
         self._ev_status = tk.Label(
-            tb, text="Формат времени: YYYY-MM-DD HH:MM (оставьте пустым — без ограничения)",
+            tb, text="Нажмите «Загрузить» для получения событий. "
+                    "Двойной клик по строке — карточка события. "
+                    "Формат времени: YYYY-MM-DD HH:MM",
             bg=BG2, fg="#6c7086", font=("Segoe UI", 8))
-        self._ev_status.grid(row=2, column=0, columnspan=10,
+        self._ev_status.grid(row=2, column=0, columnspan=11,
                               padx=10, pady=(2,0), sticky="w")
 
         # Таблица событий
@@ -4457,6 +4779,195 @@ class App(tk.Tk):
         hs.grid(row=1, column=0, sticky="ew")
         tree_frm.rowconfigure(0, weight=1); tree_frm.columnconfigure(0, weight=1)
         self._tree_e._all = []
+
+        # Двойной клик / Enter → карточка события
+        self._tree_e.bind("<Double-1>", self._events_open_card)
+        self._tree_e.bind("<Return>",   self._events_open_card)
+
+    def _events_load(self):
+        """Загружает события по фильтрам времени из левой панели + лимита."""
+        if not self.zapi:
+            messagebox.showwarning("", "Сначала подключитесь к Zabbix"); return
+        # Время — из левой панели (с/по), лимит — оттуда же
+        try:
+            df = datetime.datetime.strptime(self._e_from.get().strip(), "%Y-%m-%d")
+            dt = datetime.datetime.strptime(self._e_till.get().strip(), "%Y-%m-%d") \
+                 + datetime.timedelta(days=1)
+        except ValueError:
+            df = datetime.datetime.now() - datetime.timedelta(days=7)
+            dt = datetime.datetime.now()
+        try:
+            limit = int(self._v_limit.get() or 1000)
+        except Exception:
+            limit = 1000
+
+        self._busy(True)
+        self._ev_status.configure(text=f"Загрузка событий {df.date()} → {dt.date()} …")
+        self.log(f"━━━ [Events] event.get  {df.date()} → {dt.date()}  limit={limit} ━━━",
+                 "info")
+        def _w():
+            try:
+                ev = self.zapi.get_events(int(df.timestamp()),
+                                          int(dt.timestamp()),
+                                          limit=limit)
+                def _done(evv=ev):
+                    self._events = evv
+                    self._fill_e(evv)
+                    self._busy(False)
+                    self._ev_status.configure(
+                        text=f"Загружено: {len(evv)} событий  |  "
+                             "Двойной клик — карточка события")
+                    self.log(f"  [Events] получено: {len(evv)}", "ok")
+                    try: self._fill_sum()
+                    except Exception: pass
+                self.after(0, _done)
+            except Exception as ex:
+                msg = f"Ошибка: {ex}"
+                self.after(0, lambda m=msg: (
+                    self._busy(False),
+                    self._ev_status.configure(text=m),
+                    self.log(f"  [Events] {m}", "err")))
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _events_open_card(self, event=None):
+        """Открыть окно с карточкой выбранного события."""
+        sel = self._tree_e.selection()
+        if not sel:
+            return
+        # Берём значения строки напрямую — устойчиво к переиндексации iid
+        # после применения фильтра (_ev_apply_filter переинсёртит ряды).
+        try:
+            vals = self._tree_e.item(sel[0], "values")
+        except Exception:
+            return
+        if not vals or len(vals) < 1:
+            return
+        eventid = str(vals[0])  # первая колонка — ID события
+        target = None
+        for ev in (self._events or []):
+            if str(ev.get("eventid", "")) == eventid:
+                target = ev
+                break
+        if target is None:
+            return
+        self._open_event_card_window(target)
+
+    def _open_event_card_window(self, e):
+        """Модальное окно с детальной информацией о событии."""
+        BG = "#181825"; FG = "#cdd6f4"; ACC = "#89b4fa"
+        win = tk.Toplevel(self)
+        win.title(f"Карточка события — {e.get('eventid','')}")
+        win.configure(bg=BG)
+        win.geometry("760x600")
+        win.minsize(520, 380)
+        try: win.transient(self)
+        except: pass
+
+        sid = str(e.get("severity", "0"))
+        sev_name = SEVERITY_NAMES.get(sid, sid)
+        sev_color = SEVERITY_HEX.get(sid, "#cdd6f4")
+
+        tk.Label(win, text=f"  {e.get('name','(без имени)')}",
+                 bg=BG, fg=ACC, wraplength=720, justify="left",
+                 font=("Segoe UI", 13, "bold")).pack(fill="x", pady=(10, 2))
+        tk.Label(win, text=f"  Серьёзность: {sev_name}",
+                 bg=BG, fg=sev_color,
+                 font=("Segoe UI", 10, "bold")).pack(fill="x", pady=(0, 4))
+        ttk.Separator(win).pack(fill="x", padx=8, pady=(0, 6))
+
+        txt = tk.Text(win, bg=BG, fg=FG, font=("Consolas", 10),
+                      relief="flat", state="normal", wrap="word",
+                      padx=16, pady=10, selectbackground="#313244")
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        txt.tag_configure("hdr", foreground=ACC, font=("Segoe UI", 11, "bold"))
+        txt.tag_configure("key", foreground="#cba6f7", font=("Consolas", 10, "bold"))
+        txt.tag_configure("val", foreground=FG, font=("Consolas", 10))
+        txt.tag_configure("ok",  foreground="#a6e3a1")
+        txt.tag_configure("bad", foreground="#f38ba8")
+        txt.tag_configure("dim", foreground="#6c7086")
+
+        def sec(t): txt.insert("end", f"\n● {t}\n", "hdr")
+        def row(k, v, tag="val"):
+            txt.insert("end", f"  {k:<24}", "key")
+            txt.insert("end", f"{v}\n", tag)
+
+        sec("Основное")
+        row("Event ID",     e.get("eventid", "—"))
+        row("Object ID",    e.get("objectid", "—"))
+        row("Серьёзность",  sev_name)
+        row("Имя",          e.get("name", ""))
+        row("Источник",     e.get("source", ""))
+        row("Тип объекта",  e.get("object", ""))
+        clk = int(e.get("clock", 0) or 0)
+        row("Время",        ts2str(clk) if clk else "—")
+        rc = e.get("r_clock", "0") or "0"
+        if rc and rc != "0":
+            row("Восстановлено", ts2str(rc), "ok")
+            try:
+                row("Длительность", dur_str_from(clk, int(rc)))
+            except Exception: pass
+        else:
+            row("Восстановлено", "Не восстановлено", "bad")
+            row("Длительность",   dur_str(clk) if clk else "—")
+        row("Value (тип)",  e.get("value", ""))
+        row("Acknowledged", "Да" if str(e.get("acknowledged","0")) == "1" else "Нет",
+            "ok" if str(e.get("acknowledged","0")) == "1" else "dim")
+
+        sec("Хост")
+        hl = e.get("hosts", []) or []
+        if hl:
+            for h in hl:
+                row("host",   h.get("host", ""))
+                row("name",   h.get("name", "") or h.get("host", ""))
+                if h.get("hostid"):
+                    row("hostid", h.get("hostid", ""))
+        else:
+            txt.insert("end", "  (нет данных по хосту)\n", "dim")
+
+        sec("Подтверждения")
+        acks = e.get("acknowledges", []) or []
+        if acks:
+            row("Кол-во", len(acks))
+            for i, a in enumerate(acks[:10], 1):
+                ack_clk = int(a.get("clock", 0) or 0)
+                msg = a.get("message", "") or ""
+                txt.insert("end",
+                    f"  {i}. {ts2str(ack_clk) if ack_clk else '—'}  "
+                    f"user={a.get('userid','?')}\n", "val")
+                if msg:
+                    txt.insert("end", f"     {msg}\n", "dim")
+            if len(acks) > 10:
+                txt.insert("end", f"  … ещё {len(acks)-10}\n", "dim")
+        else:
+            txt.insert("end", "  Нет\n", "dim")
+
+        sec("Теги")
+        tags = e.get("tags", []) or []
+        if tags:
+            for tg in tags:
+                v = tg.get("value", "")
+                txt.insert("end", f"  • {tg.get('tag','')}", "key")
+                txt.insert("end", f"{': ' + v if v else ''}\n", "val")
+        else:
+            txt.insert("end", "  (нет тегов)\n", "dim")
+
+        sec("Дополнительно")
+        for fld in ("opdata", "comments", "url", "correlationid",
+                    "userid", "suppressed", "ns", "cause_eventid"):
+            v = e.get(fld)
+            if v not in (None, "", "0"):
+                row(fld, str(v))
+
+        txt.configure(state="disabled")
+
+        btn_frm = tk.Frame(win, bg=BG)
+        btn_frm.pack(fill="x", side="bottom", pady=6)
+        ttk.Button(btn_frm, text="Закрыть",
+                   command=win.destroy).pack(side="right", padx=10)
 
     def _ev_reset_filter(self):
         for v in self._ev_sev_vars.values():
