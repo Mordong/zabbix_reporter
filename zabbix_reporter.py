@@ -1,5 +1,5 @@
 """
-Zabbix Reporter v3.4.2  —  Windows 10/11
+Zabbix Reporter v3.5.0  —  Windows 10/11
 Получение репортов из Zabbix 7.x через JSON-RPC API
 Экспорт: PDF, Excel (.xlsx), CSV
 Данные: Проблемы/Алерты, Графики метрик, Статус хостов, История событий
@@ -1118,30 +1118,50 @@ class ZabbixAPI:
         """
         Расширенные данные хостов для вкладки «Объекты мониторинга».
         Возвращает хосты со всеми нужными полями.
-        """
-        params = {
-            "output": ["hostid", "host", "name", "status", "description",
-                       "proxy_hostid"],
-            "selectInterfaces":      ["interfaceid", "type", "ip", "dns",
-                                      "port", "useip", "main"],
-            "selectHostGroups":      ["groupid", "name"],   # Zabbix 6.2+
-            "selectParentTemplates": ["templateid", "name", "host"],
-            "selectTags":            ["tag", "value"],
-            "selectMacros":          ["macro", "value", "description", "type"],
-            "sortfield": "name",
-        }
-        if hostids:
-            params["hostids"] = hostids
-        if groupids:
-            params["groupids"] = groupids
-        if templateids:
-            params["templateids"] = templateids
 
+        Совместимость: в Zabbix 7.0 поле host.proxy_hostid удалено —
+        вместо него proxyid / proxy_groupid и селектор monitored_by
+        (0 — сервер, 1 — прокси, 2 — группа прокси). Запрос неизвестного
+        поля в output приводит к ошибке "Invalid parameter /output/...",
+        поэтому набор полей выбирается по версии API с фолбэком по ошибке.
+        """
+        v7 = bool(self._api_version and self._api_version >= (7, 0))
+        proxy_fields_v7  = ["proxyid", "proxy_groupid", "monitored_by"]
+        proxy_fields_old = ["proxy_hostid"]
+
+        def _params(proxy_fields):
+            p = {
+                "output": ["hostid", "host", "name", "status", "description",
+                           "maintenance_status", "maintenanceid"] + proxy_fields,
+                # "available" нужен карточке хоста для статуса интерфейсов
+                "selectInterfaces":      ["interfaceid", "type", "ip", "dns",
+                                          "port", "useip", "main", "available"],
+                "selectHostGroups":      ["groupid", "name"],   # Zabbix 6.2+
+                "selectParentTemplates": ["templateid", "name", "host"],
+                "selectTags":            ["tag", "value"],
+                "selectMacros":          ["macro", "value", "description", "type"],
+                "sortfield": "name",
+            }
+            if hostids:
+                p["hostids"] = hostids
+            if groupids:
+                p["groupids"] = groupids
+            if templateids:
+                p["templateids"] = templateids
+            return p
+
+        params = _params(proxy_fields_v7 if v7 else proxy_fields_old)
         try:
             hosts = self._call("host.get", params)
         except Exception as e:
-            # Zabbix <6.2 does not support selectHostGroups — fall back
-            if "selectHostGroups" in str(e) or "unexpected parameter" in str(e).lower():
+            emsg = str(e).lower()
+            if "proxy" in emsg and ("output" in emsg or "invalid parameter" in emsg):
+                # Версия определена неверно — пробуем альтернативный набор полей
+                params = _params(proxy_fields_old if v7 else proxy_fields_v7)
+                v7 = not v7
+                hosts = self._call("host.get", params)
+            elif "selectHostGroups" in str(e) or "unexpected parameter" in emsg:
+                # Zabbix <6.2 не поддерживает selectHostGroups
                 params["selectGroups"] = params.pop("selectHostGroups")
                 hosts = self._call("host.get", params)
             else:
@@ -1169,31 +1189,68 @@ class ZabbixAPI:
         except Exception:
             av_map = {}
 
-        # Proxy names
-        proxy_ids = list({h["proxy_hostid"] for h in hosts
-                          if h.get("proxy_hostid") and h["proxy_hostid"] != "0"})
+        # Proxy names — версионно:
+        #   7.0+: host.proxyid → proxy.get(name), host.proxy_groupid → proxygroup.get(name)
+        #   6.x:  host.proxy_hostid → proxy.get (имя в поле "host"), фолбэк host.get
         proxy_map = {}
-        if proxy_ids:
-            try:
-                proxies = self._call("proxy.get", {
-                    "output": ["proxyid", "name"],
-                    "proxyids": proxy_ids,
-                })
-                proxy_map = {p["proxyid"]: p["name"] for p in proxies}
-            except Exception:
-                # Zabbix <7 uses host.get with proxy_hostid
+        pgrp_map  = {}
+        if v7:
+            pids  = list({h["proxyid"] for h in hosts
+                          if h.get("proxyid") and h["proxyid"] != "0"})
+            pgids = list({h["proxy_groupid"] for h in hosts
+                          if h.get("proxy_groupid") and h["proxy_groupid"] != "0"})
+            if pids:
                 try:
-                    prx = self._call("host.get", {
-                        "output": ["hostid","host"],
-                        "hostids": proxy_ids,
-                    })
-                    proxy_map = {p["hostid"]: p["host"] for p in prx}
+                    proxies = self._call("proxy.get", {
+                        "output": ["proxyid", "name"], "proxyids": pids})
+                    proxy_map = {p["proxyid"]: p["name"] for p in proxies}
                 except Exception:
                     pass
+            if pgids:
+                try:
+                    pgs = self._call("proxygroup.get", {
+                        "output": ["proxy_groupid", "name"],
+                        "proxy_groupids": pgids})
+                    pgrp_map = {g["proxy_groupid"]: g["name"] for g in pgs}
+                except Exception:
+                    pass
+        else:
+            proxy_ids = list({h["proxy_hostid"] for h in hosts
+                              if h.get("proxy_hostid") and h["proxy_hostid"] != "0"})
+            if proxy_ids:
+                try:
+                    proxies = self._call("proxy.get", {
+                        "output": ["proxyid", "host"],
+                        "proxyids": proxy_ids,
+                    })
+                    proxy_map = {p["proxyid"]: p.get("host", p.get("name", ""))
+                                 for p in proxies}
+                except Exception:
+                    try:
+                        prx = self._call("host.get", {
+                            "output": ["hostid", "host"],
+                            "hostids": proxy_ids,
+                        })
+                        proxy_map = {p["hostid"]: p["host"] for p in prx}
+                    except Exception:
+                        pass
 
         for h in hosts:
             h["_agent_version"] = av_map.get(h["hostid"], "")
-            h["_proxy_name"]    = proxy_map.get(h.get("proxy_hostid","0"), "Zabbix Server")
+            if v7:
+                mb = str(h.get("monitored_by", "0"))
+                if mb == "1":
+                    h["_proxy_name"] = proxy_map.get(h.get("proxyid", "0"),
+                                                     "Proxy")
+                elif mb == "2":
+                    h["_proxy_name"] = ("Proxy group: " +
+                                        pgrp_map.get(h.get("proxy_groupid", "0"),
+                                                     "?"))
+                else:
+                    h["_proxy_name"] = "Zabbix Server"
+            else:
+                h["_proxy_name"] = proxy_map.get(h.get("proxy_hostid", "0"),
+                                                 "Zabbix Server")
 
         return hosts
 
@@ -1365,6 +1422,33 @@ class ZabbixAPI:
             "time_from": time_from, "time_till": time_till,
             "sortfield": "clock", "sortorder": "ASC",
             "limit": limit,
+        })
+
+    def get_host_items(self, hostid):
+        """
+        Метрики (items) одного хоста для карточки.
+        Поля output совместимы с Zabbix 6.0–7.4 (объект item).
+        """
+        return self._call("item.get", {
+            "output": ["itemid", "name", "key_", "lastvalue", "lastclock",
+                       "units", "value_type", "status", "state", "error",
+                       "delay"],
+            "hostids": [hostid],
+            "sortfield": "name",
+        })
+
+    def get_host_triggers(self, hostid):
+        """
+        Триггеры одного хоста для карточки (с раскрытыми макросами в имени).
+        Поля output совместимы с Zabbix 6.0–7.4 (объект trigger).
+        """
+        return self._call("trigger.get", {
+            "output": ["triggerid", "description", "priority", "status",
+                       "value", "state", "lastchange", "error"],
+            "hostids": [hostid],
+            "expandDescription": True,
+            "sortfield": "priority",
+            "sortorder": "DESC",
         })
 
     def get_hosts_latest_activity(self, host_ids, age_seconds: int = 900) -> dict:
@@ -1967,23 +2051,26 @@ class PDFReporter:
 #  Excel генератор (openpyxl)
 # ══════════════════════════════════════════════════════════════════════════════
 class ExcelReporter:
-    _HF  = Font(bold=True, color="FFFFFF", size=10, name="Segoe UI")
-    _HFL = PatternFill("solid", fgColor="0F3460")
-    _TH  = Side(style="thin", color="CCCCCC")
-    _BRD = Border(**{s: Side(style="thin", color="CCCCCC")
-                     for s in ("left","right","top","bottom")})
-    _ALT = [PatternFill("solid", fgColor="F5F8FF"),
-            PatternFill("solid", fgColor="FFFFFF")]
-    _SEV = {
-        "0": PatternFill("solid", fgColor="ECEFF1"),
-        "1": PatternFill("solid", fgColor="BBDEFB"),
-        "2": PatternFill("solid", fgColor="FFF9C4"),
-        "3": PatternFill("solid", fgColor="FFE0B2"),
-        "4": PatternFill("solid", fgColor="FFCCBC"),
-        "5": PatternFill("solid", fgColor="EF9A9A"),
-    }
-
     def __init__(self, path):
+        # ВАЖНО: стили создаются в __init__, а не на уровне класса.
+        # Атрибуты уровня класса вычисляются при импорте модуля, и без
+        # установленного openpyxl приложение падало с NameError: Font,
+        # хотя импорт библиотеки защищён флагом EXCEL_OK.
+        self._HF  = Font(bold=True, color="FFFFFF", size=10, name="Segoe UI")
+        self._HFL = PatternFill("solid", fgColor="0F3460")
+        self._TH  = Side(style="thin", color="CCCCCC")
+        self._BRD = Border(**{s: Side(style="thin", color="CCCCCC")
+                              for s in ("left","right","top","bottom")})
+        self._ALT = [PatternFill("solid", fgColor="F5F8FF"),
+                     PatternFill("solid", fgColor="FFFFFF")]
+        self._SEV = {
+            "0": PatternFill("solid", fgColor="ECEFF1"),
+            "1": PatternFill("solid", fgColor="BBDEFB"),
+            "2": PatternFill("solid", fgColor="FFF9C4"),
+            "3": PatternFill("solid", fgColor="FFE0B2"),
+            "4": PatternFill("solid", fgColor="FFCCBC"),
+            "5": PatternFill("solid", fgColor="EF9A9A"),
+        }
         self.path = path
         self.wb   = openpyxl.Workbook()
 
@@ -2438,6 +2525,207 @@ def _cfg_save(data: dict) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Всплывающее окно логирования
 # ══════════════════════════════════════════════════════════════════════════════
+class SearchableCombobox(ttk.Combobox):
+    """
+    Выпадающий список с поиском по набору текста.
+
+    Вместо нативного popdown (который на Windows перехватывает клавиатурный
+    фокус при каждом открытии) используется собственный выпадающий список:
+    Toplevel(overrideredirect) + Listbox(takefocus=0). Он физически не может
+    забрать фокус у поля ввода — печать никогда не прерывается.
+
+    Поведение:
+      • печать фильтрует список (подстрока, без учёта регистра) и открывает
+        собственный список под полем; фокус остаётся в поле ввода;
+      • ↓ / ↑ — перемещение по списку, Enter — выбрать подсвеченный пункт,
+        клик мышью — выбрать пункт;
+      • Escape — закрыть список; повторный Escape — очистить поле;
+      • клик по стрелке — нативный список (с учётом набранного фильтра);
+      • выбор значения восстанавливает полный список.
+
+    Полный набор значений хранится в _all_values и обновляется при любом
+    присвоении cb["values"] = ... (оно проходит через configure()).
+    """
+
+    _NAV_KEYS = {"Up", "Down", "Left", "Right", "Return", "KP_Enter",
+                 "Tab", "ISO_Left_Tab", "Home", "End", "Prior", "Next",
+                 "Shift_L", "Shift_R", "Control_L", "Control_R",
+                 "Alt_L", "Alt_R", "Caps_Lock", "Win_L", "Win_R", "App",
+                 "Escape"}
+    _MAX_ROWS = 12
+
+    def __init__(self, master=None, **kw):
+        kw.pop("state", None)          # для печати нужен state="normal"
+        super().__init__(master, **kw)
+        self._all_values = list(kw.get("values", ()))
+        self._popup = None
+        self._lb = None
+        self.bind("<KeyRelease>", self._on_keyrelease, add="+")
+        self.bind("<<ComboboxSelected>>", self._on_selected, add="+")
+        self.bind("<FocusOut>", self._on_focus_out, add="+")
+        self.bind("<Escape>", self._on_escape, add="+")
+        self.bind("<Down>", self._on_down, add="+")
+        self.bind("<Up>", self._on_up, add="+")
+        self.bind("<Return>", self._on_return, add="+")
+        self.bind("<KP_Enter>", self._on_return, add="+")
+        # клик по самому полю/стрелке — закрыть свой список
+        # (нативный откроется штатно, с учётом фильтра в values)
+        self.bind("<Button-1>", lambda e: self._popup_hide(), add="+")
+        self.bind("<Destroy>", lambda e: self._popup_hide(), add="+")
+
+    # ── перехват values, чтобы помнить полный список ─────────────────────
+    def configure(self, cnf=None, **kw):
+        if isinstance(cnf, dict) and "values" in cnf:
+            self._all_values = list(cnf["values"])
+        if "values" in kw:
+            self._all_values = list(kw["values"])
+        return super().configure(cnf, **kw)
+
+    config = configure
+
+    # ── реакция на печать ──────────────────────────────────────────────────
+    def _on_keyrelease(self, ev):
+        if ev.keysym in self._NAV_KEYS:
+            return
+        text = self.get().strip().lower()
+        if text:
+            filtered = [v for v in self._all_values
+                        if text in str(v).lower()]
+        else:
+            filtered = list(self._all_values)
+        # нативный список тоже видит фильтр (пустой результат — полный
+        # список, чтобы не «запереть» пользователя)
+        super().configure(values=filtered if filtered else self._all_values)
+        if text and filtered:
+            self._popup_show(filtered)
+        else:
+            self._popup_hide()
+
+    def _on_selected(self, ev=None):
+        # после выбора вернуть полный список для следующего открытия
+        super().configure(values=self._all_values)
+        self._popup_hide()
+
+    # ── клавиатура ─────────────────────────────────────────────────────────
+    def _popup_open(self):
+        return (self._popup is not None and self._popup.winfo_exists()
+                and self._popup.winfo_ismapped())
+
+    def _on_down(self, ev=None):
+        if not self._popup_open():
+            return None            # нативное поведение (открыть popdown)
+        self._lb_move(+1)
+        return "break"
+
+    def _on_up(self, ev=None):
+        if not self._popup_open():
+            return None
+        self._lb_move(-1)
+        return "break"
+
+    def _on_return(self, ev=None):
+        if not self._popup_open():
+            return None
+        sel = self._lb.curselection()
+        if sel:
+            self._accept(self._lb.get(sel[0]))
+        return "break"
+
+    def _on_escape(self, ev=None):
+        if self._popup_open():
+            self._popup_hide()          # 1-е нажатие — закрыть список
+        else:
+            self.set("")                # 2-е — очистить поле
+            super().configure(values=self._all_values)
+        return "break"
+
+    def _on_focus_out(self, ev=None):
+        # небольшая задержка, чтобы клик по пункту списка успел сработать
+        try:
+            self.after(150, self._popup_hide)
+        except Exception:
+            pass
+
+    def _lb_move(self, delta):
+        n = self._lb.size()
+        if not n:
+            return
+        cur = self._lb.curselection()
+        i = (cur[0] + delta) if cur else (0 if delta > 0 else n - 1)
+        i = max(0, min(n - 1, i))
+        self._lb.selection_clear(0, "end")
+        self._lb.selection_set(i)
+        self._lb.activate(i)
+        self._lb.see(i)
+
+    def _accept(self, value):
+        self.set(value)
+        self.icursor("end")
+        super().configure(values=self._all_values)
+        self._popup_hide()
+        # уведомить подписчиков так же, как при выборе из нативного списка
+        self.event_generate("<<ComboboxSelected>>")
+
+    # ── собственный выпадающий список ──────────────────────────────────────
+    def _popup_show(self, items):
+        try:
+            if self._popup is None or not self._popup.winfo_exists():
+                self._popup = tk.Toplevel(self)
+                self._popup.overrideredirect(True)
+                try:
+                    self._popup.attributes("-topmost", True)
+                except Exception:
+                    pass
+                self._lb = tk.Listbox(
+                    self._popup, exportselection=False, takefocus=0,
+                    activestyle="none", borderwidth=1, relief="solid",
+                    bg="#313244", fg="#cdd6f4",
+                    selectbackground="#89b4fa", selectforeground="#11111b",
+                    font=("Segoe UI", 9))
+                self._lb.pack(fill="both", expand=True)
+                self._lb.bind("<ButtonRelease-1>", self._on_lb_click)
+                self._lb.bind("<Motion>", self._on_lb_motion)
+            self._lb.delete(0, "end")
+            for it in items:
+                self._lb.insert("end", it)
+            rows = min(len(items), self._MAX_ROWS)
+            self._lb.configure(height=rows)
+            self._lb.selection_clear(0, "end")
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+            self._popup.update_idletasks()
+            x = self.winfo_rootx()
+            y = self.winfo_rooty() + self.winfo_height()
+            w = max(self.winfo_width(), self._lb.winfo_reqwidth())
+            h = self._lb.winfo_reqheight()
+            self._popup.geometry(f"{w}x{h}+{x}+{y}")
+            self._popup.deiconify()
+            self._popup.lift()
+        except Exception:
+            # не удалось показать список — фильтрация в values всё равно
+            # работает, пользователь увидит её по стрелке вниз
+            self._popup_hide()
+
+    def _popup_hide(self):
+        try:
+            if self._popup is not None and self._popup.winfo_exists():
+                self._popup.withdraw()
+        except Exception:
+            pass
+
+    def _on_lb_click(self, ev):
+        i = self._lb.nearest(ev.y)
+        if i >= 0:
+            self._accept(self._lb.get(i))
+
+    def _on_lb_motion(self, ev):
+        i = self._lb.nearest(ev.y)
+        if i >= 0:
+            self._lb.selection_clear(0, "end")
+            self._lb.selection_set(i)
+            self._lb.activate(i)
+
+
 class LogWindow(tk.Toplevel):
     TAG_COLORS = {
         "req":  "#89b4fa", "ok":   "#a6e3a1", "err":  "#f38ba8",
@@ -2676,7 +2964,7 @@ class LogWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("⚡ Zabbix Reporter v3.4.2")
+        self.title("⚡ Zabbix Reporter v3.5.0")
         self.geometry("1540x860")
         self.minsize(1200, 700)
         self.configure(bg="#1e1e2e")
@@ -2694,8 +2982,6 @@ class App(tk.Tk):
         self._log_win      = None   # окно лога (Toplevel)
 
         self._cfg = _cfg_load()
-        self._obj_grp_map = {}   # name -> groupid
-        self._obj_tpl_map = {}   # name -> templateid
 
         self._build_style()
         self._build_ui()
@@ -2755,7 +3041,7 @@ class App(tk.Tk):
     def _build_ui(self):
         hdr = tk.Frame(self, bg="#181825", height=52)
         hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.4.2",
+        tk.Label(hdr, text="⚡ Zabbix Reporter  v3.5.0",
                  bg="#181825", fg="#89b4fa",
                  font=("Segoe UI",17,"bold")).pack(side="left", padx=18, pady=10)
         self._lbl_ver  = tk.Label(hdr, text="", bg="#181825",
@@ -2966,115 +3252,6 @@ class App(tk.Tk):
             tk.Label(g3, text="Excel: pip install openpyxl",
                      bg=BG, fg="#f38ba8", font=("Segoe UI", 8)).pack(anchor="w")
         btn(g3, "📋 Экспорт CSV", self._export_csv)
-
-
-    # ── Вкладка «Объекты мониторинга» ────────────────────────────────────────
-    def _build_objects_tab(self, parent):
-        BG = "#1e1e2e"; BG2 = "#313244"; FG = "#cdd6f4"; ACC = "#89b4fa"
-
-        # ── Панель фильтров (верх) ────────────────────────────────────────────
-        flt = tk.Frame(parent, bg=BG2, pady=6)
-        flt.pack(fill="x", padx=4, pady=(4,0))
-
-        tk.Label(flt, text="Фильтр:", bg=BG2, fg=ACC,
-                 font=("Segoe UI",9,"bold")).grid(row=0,column=0,padx=(10,4),sticky="w")
-
-        # По группе хостов
-        tk.Label(flt, text="Группа:", bg=BG2, fg=FG,
-                 font=("Segoe UI",9)).grid(row=0,column=1,padx=(0,2),sticky="w")
-        self._obj_grp_var = tk.StringVar(value="— все —")
-        self._cmb_obj_grp = ttk.Combobox(flt, textvariable=self._obj_grp_var,
-                                           state="readonly", width=22)
-        self._cmb_obj_grp.grid(row=0,column=2,padx=(0,8))
-
-        # По шаблону
-        tk.Label(flt, text="Шаблон:", bg=BG2, fg=FG,
-                 font=("Segoe UI",9)).grid(row=0,column=3,padx=(0,2),sticky="w")
-        self._obj_tpl_var = tk.StringVar(value="— все —")
-        self._cmb_obj_tpl = ttk.Combobox(flt, textvariable=self._obj_tpl_var,
-                                           state="readonly", width=28)
-        self._cmb_obj_tpl.grid(row=0,column=4,padx=(0,8))
-
-        # Поиск по имени
-        tk.Label(flt, text="🔍", bg=BG2, fg=FG).grid(row=0,column=5,padx=(0,2))
-        self._obj_search_var = tk.StringVar()
-        self._obj_search_var.trace_add("write", lambda *_: self._obj_apply_filter())
-        ttk.Entry(flt, textvariable=self._obj_search_var,
-                  width=22).grid(row=0,column=6,padx=(0,6))
-
-        ttk.Button(flt, text="🔄 Загрузить",
-                   command=self._obj_load).grid(row=0,column=7,padx=(0,10))
-
-        self._cmb_obj_grp.bind("<<ComboboxSelected>>", lambda _: self._obj_apply_filter())
-        self._cmb_obj_tpl.bind("<<ComboboxSelected>>", lambda _: self._obj_apply_filter())
-
-        # ── Список хостов (слева) + детали (справа) ─────────────────────────
-        paned = tk.PanedWindow(parent, orient="horizontal",
-                                bg=BG, sashrelief="flat", sashwidth=5)
-        paned.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Левая часть — таблица хостов
-        left_frm = tk.Frame(paned, bg=BG)
-        paned.add(left_frm, minsize=300)
-
-        cols_obj = ("Хост", "Видимое имя", "Группы", "Статус", "Доступность", "IP")
-        self._tree_obj = ttk.Treeview(left_frm, columns=cols_obj,
-                                       show="headings", selectmode="browse")
-        for col, w in zip(cols_obj, (140,150,140,70,90,120)):
-            self._tree_obj.heading(col, text=col,
-                command=lambda c=col: self._sort(self._tree_obj, c))
-            self._tree_obj.column(col, width=w, minwidth=40)
-        vs_obj = ttk.Scrollbar(left_frm, orient="vertical",
-                                command=self._tree_obj.yview)
-        hs_obj = ttk.Scrollbar(left_frm, orient="horizontal",
-                                command=self._tree_obj.xview)
-        self._tree_obj.configure(yscrollcommand=vs_obj.set,
-                                  xscrollcommand=hs_obj.set)
-        self._tree_obj.grid(row=0,column=0,sticky="nsew")
-        vs_obj.grid(row=0,column=1,sticky="ns")
-        hs_obj.grid(row=1,column=0,sticky="ew")
-        left_frm.rowconfigure(0,weight=1); left_frm.columnconfigure(0,weight=1)
-        self._tree_obj._all = []
-
-        # Теги цветов
-        self._tree_obj.tag_configure("ok",  foreground="#a6e3a1")
-        self._tree_obj.tag_configure("bad", foreground="#f38ba8")
-        self._tree_obj.tag_configure("unk", foreground="#f9e2af")
-        self._tree_obj.tag_configure("dis", foreground="#6c7086")
-
-        self._tree_obj.bind("<<TreeviewSelect>>", self._obj_on_select)
-
-        # Правая часть — карточка хоста
-        right_frm = tk.Frame(paned, bg="#181825")
-        paned.add(right_frm, minsize=340)
-
-        tk.Label(right_frm, text="  Карточка хоста",
-                 bg="#181825", fg=ACC,
-                 font=("Segoe UI",10,"bold")).pack(fill="x", pady=(8,2))
-        ttk.Separator(right_frm).pack(fill="x")
-
-        self._obj_detail = tk.Text(
-            right_frm, bg="#181825", fg=FG,
-            font=("Consolas",9), relief="flat",
-            state="disabled", wrap="word",
-            padx=12, pady=8,
-            selectbackground="#313244",
-        )
-        obj_sb = ttk.Scrollbar(right_frm, command=self._obj_detail.yview)
-        self._obj_detail.configure(yscrollcommand=obj_sb.set)
-        self._obj_detail.pack(side="left", fill="both", expand=True)
-        obj_sb.pack(side="right", fill="y")
-
-        # Теги для форматирования карточки
-        self._obj_detail.tag_configure("hdr",
-            foreground=ACC, font=("Segoe UI",10,"bold"))
-        self._obj_detail.tag_configure("key",
-            foreground="#cba6f7", font=("Consolas",9,"bold"))
-        self._obj_detail.tag_configure("val",
-            foreground=FG, font=("Consolas",9))
-        self._obj_detail.tag_configure("ok",  foreground="#a6e3a1")
-        self._obj_detail.tag_configure("bad", foreground="#f38ba8")
-        self._obj_detail.tag_configure("dim", foreground="#6c7086")
 
 
     # ── Вкладка «Аутентификация» ──────────────────────────────────────────────
@@ -3473,15 +3650,15 @@ class App(tk.Tk):
         tk.Label(tb, text="Шаблон A:", bg="#252535", fg=FG,
                  font=("Segoe UI",9)).grid(row=0, column=0, padx=(10,4))
         self._cmp_a_var = tk.StringVar()
-        self._cmb_cmp_a = ttk.Combobox(tb, textvariable=self._cmp_a_var,
-                                        state="readonly", width=36)
+        self._cmb_cmp_a = SearchableCombobox(tb, textvariable=self._cmp_a_var,
+                                        width=36)
         self._cmb_cmp_a.grid(row=0, column=1, padx=(0,12))
 
         tk.Label(tb, text="Шаблон B:", bg="#252535", fg=FG,
                  font=("Segoe UI",9)).grid(row=0, column=2, padx=(0,4))
         self._cmp_b_var = tk.StringVar()
-        self._cmb_cmp_b = ttk.Combobox(tb, textvariable=self._cmp_b_var,
-                                        state="readonly", width=36)
+        self._cmb_cmp_b = SearchableCombobox(tb, textvariable=self._cmp_b_var,
+                                        width=36)
         self._cmb_cmp_b.grid(row=0, column=3, padx=(0,12))
 
         ttk.Button(tb, text="🔄 Загрузить шаблоны",
@@ -4396,15 +4573,15 @@ class App(tk.Tk):
         tk.Label(tb, text="Группа:", bg=BG2, fg=FG,
                  font=("Segoe UI", 9)).grid(row=0, column=1, padx=(0,2))
         self._hosts_grp_var = tk.StringVar(value="— все —")
-        self._cmb_hosts_grp = ttk.Combobox(tb, textvariable=self._hosts_grp_var,
-                                            state="readonly", width=22)
+        self._cmb_hosts_grp = SearchableCombobox(tb, textvariable=self._hosts_grp_var,
+                                            width=22)
         self._cmb_hosts_grp.grid(row=0, column=2, padx=(0,8))
 
         tk.Label(tb, text="Шаблон:", bg=BG2, fg=FG,
                  font=("Segoe UI", 9)).grid(row=0, column=3, padx=(0,2))
         self._hosts_tpl_var = tk.StringVar(value="— все —")
-        self._cmb_hosts_tpl = ttk.Combobox(tb, textvariable=self._hosts_tpl_var,
-                                            state="readonly", width=26)
+        self._cmb_hosts_tpl = SearchableCombobox(tb, textvariable=self._hosts_tpl_var,
+                                            width=26)
         self._cmb_hosts_tpl.grid(row=0, column=4, padx=(0,8))
 
         tk.Label(tb, text="🔍", bg=BG2, fg=FG).grid(row=0, column=5, padx=(0,2))
@@ -4555,7 +4732,12 @@ class App(tk.Tk):
             t.insert("", "end", values=row, tags=(tag,), iid=h["hostid"])
 
     def _hosts_open_card(self, event=None):
-        """Открывает модальное окно с карточкой хоста."""
+        """Открывает модальное окно с карточкой хоста.
+
+        Детали (шаблоны, теги, макросы, имя прокси, версия агента)
+        догружаются лениво — одним лёгким запросом host.get по одному
+        hostid прямо при открытии. Карточка всегда полная и актуальная,
+        независимо от того, нажималось ли «Обновить расширенно»."""
         sel = self._tree_h.selection()
         if not sel:
             return
@@ -4573,7 +4755,24 @@ class App(tk.Tk):
                     break
         if not d:
             return
-        self._open_host_card_window(d)
+        if not self.zapi:
+            self._open_host_card_window(d)
+            return
+        # Ленивая догрузка деталей в фоне, затем открытие карточки
+        self._busy(True)
+        def _w(hid=hostid, base=d):
+            merged = dict(base)
+            try:
+                det = self.zapi.get_hosts_detail(hostids=[hid])
+                if det:
+                    merged.update(det[0])
+            except Exception as ex:
+                # Открываем карточку с тем, что есть, причину пишем в лог
+                self.after(0, lambda m=str(ex): self.log(
+                    f"  [HostCard] Детали не догружены: {m}", "warn"))
+            self.after(0, lambda: (self._busy(False),
+                                   self._open_host_card_window(merged)))
+        threading.Thread(target=_w, daemon=True).start()
 
     def _open_host_card_window(self, h):
         """Модальное окно с полной карточкой хоста."""
@@ -4591,10 +4790,17 @@ class App(tk.Tk):
                  font=("Segoe UI", 13, "bold")).pack(fill="x", pady=(10, 2))
         ttk.Separator(win).pack(fill="x", padx=8, pady=(0,6))
 
-        txt = tk.Text(win, bg=BG, fg=FG, font=("Consolas", 10),
+        # ── Вкладки карточки: Обзор / Метрики / Триггеры ──────────────────
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        tab_ov = tk.Frame(nb, bg=BG); nb.add(tab_ov, text="ℹ️ Обзор")
+        tab_it = tk.Frame(nb, bg=BG); nb.add(tab_it, text="📊 Метрики")
+        tab_tr = tk.Frame(nb, bg=BG); nb.add(tab_tr, text="⚡ Триггеры")
+
+        txt = tk.Text(tab_ov, bg=BG, fg=FG, font=("Consolas", 10),
                       relief="flat", state="normal", wrap="word",
                       padx=16, pady=10, selectbackground="#313244")
-        sb = ttk.Scrollbar(win, command=txt.yview)
+        sb = ttk.Scrollbar(tab_ov, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         txt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -4690,6 +4896,225 @@ class App(tk.Tk):
 
         txt.configure(state="disabled")
 
+        # ══ Вкладки «Метрики» и «Триггеры»: таблица + фильтр + экспорт ══════
+        hostid   = h.get("hostid")
+        hostname = h.get("host", "host")
+        cache    = {"items": None, "trigs": None}
+
+        def _mk_tab(parent, cols, headers, widths, export_cb, reload_cb):
+            top = tk.Frame(parent, bg=BG); top.pack(fill="x", padx=6, pady=6)
+            tk.Label(top, text="🔍", bg=BG, fg=FG).pack(side="left")
+            ent = ttk.Entry(top, width=26); ent.pack(side="left", padx=(4, 10))
+            ttk.Button(top, text="🔄 Обновить",
+                       command=reload_cb).pack(side="left", padx=(0, 6))
+            ttk.Button(top, text="💾 Экспорт CSV",
+                       command=export_cb).pack(side="left")
+            cnt = tk.Label(top, text="", bg=BG, fg="#6c7086")
+            cnt.pack(side="right")
+            frm = tk.Frame(parent, bg=BG); frm.pack(fill="both", expand=True,
+                                                    padx=6, pady=(0, 6))
+            tree = ttk.Treeview(frm, columns=cols, show="headings")
+            for c, hd, w in zip(cols, headers, widths):
+                tree.heading(c, text=hd)
+                tree.column(c, width=w, anchor="w")
+            vs = ttk.Scrollbar(frm, command=tree.yview)
+            tree.configure(yscrollcommand=vs.set)
+            tree.pack(side="left", fill="both", expand=True)
+            vs.pack(side="right", fill="y")
+            return ent, cnt, tree
+
+        # ── Метрики ─────────────────────────────────────────────────────────
+        ITEM_STATE = {"0": "OK", "1": "❌ Not supported"}
+        def _item_row(it):
+            val = it.get("lastvalue", "")
+            if len(str(val)) > 80:
+                val = str(val)[:77] + "..."
+            units = it.get("units", "")
+            if units and str(it.get("value_type","0")) in ("0", "3"):
+                val = f"{val} {units}".strip()
+            upd = ts2str(it["lastclock"]) if str(it.get("lastclock","0")) not in ("0","") else "—"
+            status = "Включена" if str(it.get("status","0")) == "0" else "Отключена"
+            state  = ITEM_STATE.get(str(it.get("state","0")), "?")
+            return (it.get("name",""), it.get("key_",""), val, upd,
+                    status, state)
+
+        def _fill_items():
+            q = ent_i.get().strip().lower()
+            tree_i.delete(*tree_i.get_children())
+            data = cache["items"] or []
+            shown = 0
+            for it in data:
+                row = _item_row(it)
+                if q and not any(q in str(c).lower() for c in row):
+                    continue
+                tag = "off" if row[4] == "Отключена" else (
+                      "bad" if "Not supported" in row[5] else "")
+                tree_i.insert("", "end", values=row, tags=(tag,))
+                shown += 1
+            cnt_i.config(text=f"{shown} из {len(data)}")
+
+        def _load_items(force=False):
+            if not self.zapi:
+                return
+            if cache["items"] is not None and not force:
+                return
+            self._busy(True)
+            def _w():
+                try:
+                    data = self.zapi.get_host_items(hostid)
+                    cache["items"] = data
+                    err = None
+                except Exception as ex:
+                    err = str(ex)
+                def _done():
+                    self._busy(False)
+                    if not win.winfo_exists():
+                        return
+                    if err:
+                        self.log(f"  [HostCard] Метрики: {err}", "err")
+                        cnt_i.config(text="ошибка загрузки — см. лог")
+                    else:
+                        _fill_items()
+                self.after(0, _done)
+            threading.Thread(target=_w, daemon=True).start()
+
+        def _export_items():
+            data = cache["items"] or []
+            if not data:
+                messagebox.showinfo("Экспорт", "Нет данных для экспорта.",
+                                    parent=win); return
+            tsn  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".csv",
+                initialfile=f"{hostname}_metrics_{tsn}.csv",
+                filetypes=[("CSV", "*.csv")])
+            if not path:
+                return
+            try:
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    wcsv = csv.writer(f, delimiter=";")
+                    wcsv.writerow(["Имя", "Ключ", "Последнее значение",
+                                   "Обновлено", "Статус", "Состояние",
+                                   "Интервал", "Ошибка"])
+                    for it in data:
+                        r = _item_row(it)
+                        wcsv.writerow([r[0], r[1], it.get("lastvalue",""),
+                                       r[3], r[4], r[5],
+                                       it.get("delay",""), it.get("error","")])
+                self.log(f"✓ Метрики хоста {hostname} экспортированы: {path}", "ok")
+            except Exception as ex:
+                messagebox.showerror("Экспорт", f"Ошибка записи:\n{ex}",
+                                     parent=win)
+
+        ent_i, cnt_i, tree_i = _mk_tab(
+            tab_it,
+            ("name", "key", "value", "updated", "status", "state"),
+            ("Имя", "Ключ", "Последнее значение", "Обновлено",
+             "Статус", "Состояние"),
+            (200, 170, 150, 125, 75, 90),
+            _export_items, lambda: _load_items(force=True))
+        tree_i.tag_configure("off", foreground="#6c7086")
+        tree_i.tag_configure("bad", foreground="#f38ba8")
+        ent_i.bind("<KeyRelease>", lambda e: _fill_items())
+
+        # ── Триггеры ────────────────────────────────────────────────────────
+        def _trig_row(t):
+            sev = str(t.get("priority", "0"))
+            val = "🔴 PROBLEM" if str(t.get("value","0")) == "1" else "🟢 OK"
+            status = "Включён" if str(t.get("status","0")) == "0" else "Отключён"
+            lc = ts2str(t["lastchange"]) if str(t.get("lastchange","0")) not in ("0","") else "—"
+            return (f"{sev} – {SEVERITY_NAMES.get(sev, sev)}",
+                    t.get("description",""), val, status, lc)
+
+        def _fill_trigs():
+            q = ent_t.get().strip().lower()
+            tree_t.delete(*tree_t.get_children())
+            data = cache["trigs"] or []
+            shown = 0
+            for t in data:
+                row = _trig_row(t)
+                if q and not any(q in str(c).lower() for c in row):
+                    continue
+                tag = ("prob" if "PROBLEM" in row[2] else
+                       "off"  if row[3] == "Отключён" else "")
+                tree_t.insert("", "end", values=row, tags=(tag,))
+                shown += 1
+            cnt_t.config(text=f"{shown} из {len(data)}")
+
+        def _load_trigs(force=False):
+            if not self.zapi:
+                return
+            if cache["trigs"] is not None and not force:
+                return
+            self._busy(True)
+            def _w():
+                try:
+                    data = self.zapi.get_host_triggers(hostid)
+                    cache["trigs"] = data
+                    err = None
+                except Exception as ex:
+                    err = str(ex)
+                def _done():
+                    self._busy(False)
+                    if not win.winfo_exists():
+                        return
+                    if err:
+                        self.log(f"  [HostCard] Триггеры: {err}", "err")
+                        cnt_t.config(text="ошибка загрузки — см. лог")
+                    else:
+                        _fill_trigs()
+                self.after(0, _done)
+            threading.Thread(target=_w, daemon=True).start()
+
+        def _export_trigs():
+            data = cache["trigs"] or []
+            if not data:
+                messagebox.showinfo("Экспорт", "Нет данных для экспорта.",
+                                    parent=win); return
+            tsn  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".csv",
+                initialfile=f"{hostname}_triggers_{tsn}.csv",
+                filetypes=[("CSV", "*.csv")])
+            if not path:
+                return
+            try:
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    wcsv = csv.writer(f, delimiter=";")
+                    wcsv.writerow(["Серьёзность", "Имя", "Состояние",
+                                   "Статус", "Изменён", "Ошибка"])
+                    for t in data:
+                        r = _trig_row(t)
+                        wcsv.writerow([r[0], r[1],
+                                       "PROBLEM" if "PROBLEM" in r[2] else "OK",
+                                       r[3], r[4], t.get("error","")])
+                self.log(f"✓ Триггеры хоста {hostname} экспортированы: {path}", "ok")
+            except Exception as ex:
+                messagebox.showerror("Экспорт", f"Ошибка записи:\n{ex}",
+                                     parent=win)
+
+        ent_t, cnt_t, tree_t = _mk_tab(
+            tab_tr,
+            ("sev", "name", "value", "status", "changed"),
+            ("Серьёзность", "Имя", "Состояние", "Статус", "Изменён"),
+            (120, 330, 100, 80, 130),
+            _export_trigs, lambda: _load_trigs(force=True))
+        tree_t.tag_configure("prob", foreground="#f38ba8")
+        tree_t.tag_configure("off",  foreground="#6c7086")
+        ent_t.bind("<KeyRelease>", lambda e: _fill_trigs())
+
+        # ── Ленивая загрузка при первом открытии вкладки ────────────────────
+        def _on_tab(_=None):
+            try:
+                cur = nb.tab(nb.select(), "text")
+            except Exception:
+                return
+            if "Метрики" in cur:
+                _load_items()
+            elif "Триггеры" in cur:
+                _load_trigs()
+        nb.bind("<<NotebookTabChanged>>", _on_tab)
+
         btn_frm = tk.Frame(win, bg=BG)
         btn_frm.pack(fill="x", side="bottom", pady=6)
         ttk.Button(btn_frm, text="Закрыть",
@@ -4723,8 +5148,8 @@ class App(tk.Tk):
         tk.Label(tb, text="Хост:", bg=BG2, fg=FG,
                  font=("Segoe UI", 9)).grid(row=1, column=0, padx=(10,4), pady=(4,0))
         self._ev_host_var = tk.StringVar(value="— все —")
-        self._cmb_ev_host = ttk.Combobox(tb, textvariable=self._ev_host_var,
-                                          state="readonly", width=28)
+        self._cmb_ev_host = SearchableCombobox(tb, textvariable=self._ev_host_var,
+                                          width=28)
         self._cmb_ev_host.grid(row=1, column=1, columnspan=3, pady=(4,0), sticky="w")
         self._cmb_ev_host.bind("<<ComboboxSelected>>",
                                 lambda _: self._ev_apply_filter())
@@ -5052,7 +5477,7 @@ class App(tk.Tk):
         top = tk.Frame(parent, bg="#1e1e2e")
         top.pack(fill="x", padx=8, pady=6)
         ttk.Label(top, text="Хост:").pack(side="left")
-        self._cmb_hm = ttk.Combobox(top, width=28, state="readonly")
+        self._cmb_hm = SearchableCombobox(top, width=28)
         self._cmb_hm.pack(side="left", padx=6)
         ttk.Label(top, text="Поиск метрики:").pack(side="left")
         self._e_ms = ttk.Entry(top, width=22)
@@ -5192,6 +5617,19 @@ class App(tk.Tk):
         threading.Thread(target=_w, daemon=True).start()
 
     def _populate(self, p, h, ev):
+        try:
+            self._populate_inner(p, h, ev)
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            self._info("Ошибка отрисовки данных — подробности в «Лог / Отладка»")
+            self.log("✗ Ошибка отрисовки данных (_populate):", "err")
+            self.log(tb, "err")
+        finally:
+            # Бегунок останавливается ВСЕГДА, даже если отрисовка упала
+            self._busy(False)
+
+    def _populate_inner(self, p, h, ev):
         self._problems, self._hosts, self._events = p, h, ev
         self._fill_p(p); self._fill_h(h); self._fill_e(ev); self._fill_sum()
         # Обновить фильтры объединённой вкладки «Хосты»
@@ -5210,7 +5648,6 @@ class App(tk.Tk):
             f"{hh.get('host','')}  [{hh.get('hostid','')}]" for hh in h]
         if h: self._cmb_hm.current(0)
 
-        self._busy(False)
         summary = f"Загружено: {len(p)} проблем | {len(h)} хостов | {len(ev)} событий"
         self._info(summary)
         self.log(f"✓ {summary}", "ok")
@@ -5867,228 +6304,6 @@ class App(tk.Tk):
                 self.after(0, lambda: self._busy(False))
         threading.Thread(target=_w, daemon=True).start()
 
-
-    # ── Объекты мониторинга ───────────────────────────────────────────────────
-    def _obj_load(self):
-        """Загрузить расширенные данные хостов с фильтрами."""
-        if not self.zapi:
-            messagebox.showwarning("", "Сначала подключитесь"); return
-        # Определить фильтры
-        grp_sel = self._obj_grp_var.get()
-        tpl_sel = self._obj_tpl_var.get()
-        groupids   = None
-        templateids= None
-        if grp_sel and grp_sel != "— все —":
-            gid = self._obj_grp_map.get(grp_sel)
-            if gid: groupids = [gid]
-        if tpl_sel and tpl_sel != "— все —":
-            tid = self._obj_tpl_map.get(tpl_sel)
-            if tid: templateids = [tid]
-
-        self._busy(True)
-        self.log(f"  [Объекты] Загрузка: group={grp_sel!r} tpl={tpl_sel!r}", "req")
-
-        def _w():
-            try:
-                hosts = self.zapi.get_hosts_detail(
-                    groupids=groupids, templateids=templateids)
-                self.after(0, lambda: self._obj_populate(hosts))
-            except Exception as ex:
-                msg = str(ex)
-                self.after(0, lambda m=msg: (
-                    self._busy(False),
-                    self.log(f"  [Объекты] Ошибка: {m}", "err"),
-                    self._info(f"Ошибка: {m}")))
-        threading.Thread(target=_w, daemon=True).start()
-
-    def _obj_init_filters(self, hosts):
-        """Заполнить выпадающие списки групп и шаблонов из загруженных хостов."""
-        groups    = {}
-        templates = {}
-        for h in hosts:
-            for g in h.get("groups", []):
-                groups[g["name"]] = g["groupid"]
-            for t in h.get("parentTemplates", []):
-                templates[t["name"]] = t["templateid"]
-        self._obj_grp_map = groups
-        self._obj_tpl_map = templates
-        grp_vals = ["— все —"] + sorted(groups.keys())
-        tpl_vals = ["— все —"] + sorted(templates.keys())
-        self._cmb_obj_grp["values"] = grp_vals
-        self._cmb_obj_tpl["values"] = tpl_vals
-        if self._obj_grp_var.get() not in grp_vals:
-            self._obj_grp_var.set("— все —")
-        if self._obj_tpl_var.get() not in tpl_vals:
-            self._obj_tpl_var.set("— все —")
-
-    def _obj_populate(self, hosts):
-        self._hosts_detail = hosts
-        self._obj_init_filters(hosts)
-        self._obj_apply_filter()
-        self._busy(False)
-        self.log(f"  [Объекты] Загружено: {len(hosts)} хостов", "ok")
-        self._info(f"Объекты: {len(hosts)} хостов")
-
-    def _obj_apply_filter(self):
-        """Применить текстовый фильтр и показать в дереве."""
-        t = self._tree_obj
-        t.delete(*t.get_children())
-        t._all = []
-        q        = self._obj_search_var.get().lower()
-        grp_sel  = self._obj_grp_var.get()
-        tpl_sel  = self._obj_tpl_var.get()
-
-        for h in self._hosts_detail:
-            # Фильтр по группе
-            if grp_sel and grp_sel != "— все —":
-                if not any(g["name"] == grp_sel for g in h.get("groups",[])):
-                    continue
-            # Фильтр по шаблону
-            if tpl_sel and tpl_sel != "— все —":
-                if not any(tp["name"] == tpl_sel
-                            for tp in h.get("parentTemplates",[])):
-                    continue
-            # Текстовый поиск
-            host_str = " ".join([
-                h.get("host",""), h.get("name",""),
-                ", ".join(g["name"] for g in h.get("groups",[])),
-            ]).lower()
-            if q and q not in host_str:
-                continue
-
-            # Определить основной IP
-            ifaces = h.get("interfaces",[])
-            main_ip = ""
-            for iface in ifaces:
-                if iface.get("main") == "1":
-                    main_ip = iface.get("ip","") or iface.get("dns","")
-                    break
-            if not main_ip and ifaces:
-                main_ip = ifaces[0].get("ip","") or ifaces[0].get("dns","")
-
-            status = "Вкл" if str(h.get("status","0")) == "0" else "Выкл"
-            grp_str = ", ".join(g["name"] for g in h.get("groups",[]))
-            avail   = HOST_AVAIL.get(str(h.get("available","0")), "?")
-
-            row = (h.get("host",""), h.get("name",""),
-                   grp_str, status, avail, main_ip)
-
-            ac  = str(h.get("available","0"))
-            dis = str(h.get("status","0")) != "0"
-            tag = "dis" if dis else ("ok" if ac=="1" else
-                                     "bad" if ac=="2" else "unk")
-            iid = t.insert("","end", values=row, tags=(tag,),
-                            iid=h["hostid"])
-            t._all.append((iid, row))
-
-        # Сбросить карточку
-        self._obj_detail.configure(state="normal")
-        self._obj_detail.delete("1.0","end")
-        self._obj_detail.configure(state="disabled")
-
-    def _obj_on_select(self, event=None):
-        """Показать карточку выбранного хоста."""
-        sel = self._tree_obj.selection()
-        if not sel: return
-        hostid = sel[0]
-        h = next((x for x in self._hosts_detail
-                   if x["hostid"] == hostid), None)
-        if not h: return
-        self._obj_show_card(h)
-
-    def _obj_show_card(self, h):
-        txt = self._obj_detail
-        txt.configure(state="normal")
-        txt.delete("1.0","end")
-
-        def row(key, val, val_tag="val"):
-            txt.insert("end", f"  {key:<22}", "key")
-            txt.insert("end", f"{val}\n", val_tag)
-
-        def section(title):
-            txt.insert("end", f"\n● {title}\n", "hdr")
-
-        # ── Основная информация ───────────────────────────────────────────────
-        section("Основное")
-        row("Host name",    h.get("host",""))
-        row("Visible name", h.get("name","") or h.get("host",""))
-        status_val = "✅ Включён" if str(h.get("status","0"))=="0" else "❌ Отключён"
-        status_tag = "ok" if str(h.get("status","0"))=="0" else "bad"
-        row("Enabled",      status_val, status_tag)
-        row("Monitored by", h.get("_proxy_name","Zabbix Server"))
-        if h.get("description"):
-            row("Description", h["description"][:120])
-
-        # ── Группы хостов ─────────────────────────────────────────────────────
-        section("Host groups")
-        for g in h.get("groups",[]):
-            txt.insert("end", f"  • {g['name']}\n", "val")
-
-        # ── Шаблоны ───────────────────────────────────────────────────────────
-        section("Templates")
-        tpls = h.get("parentTemplates",[])
-        if tpls:
-            for tp in tpls:
-                txt.insert("end", f"  • {tp.get('name','?')}\n", "val")
-        else:
-            txt.insert("end","  (нет шаблонов)\n","dim")
-
-        # ── Интерфейсы ────────────────────────────────────────────────────────
-        ITYPE = {"1":"Agent","2":"SNMP","3":"IPMI","4":"JMX"}
-        section("Interfaces")
-        ifaces = h.get("interfaces",[])
-        if ifaces:
-            for iface in ifaces:
-                itype = ITYPE.get(str(iface.get("type","1")),"?")
-                addr  = iface.get("ip","") or iface.get("dns","")
-                port  = iface.get("port","")
-                main  = " [основной]" if iface.get("main")=="1" else ""
-                txt.insert("end",
-                    f"  • {itype:<6}  {addr}:{port}{main}\n","val")
-                # Agent version
-                if str(iface.get("type","1")) == "1":
-                    av = h.get("_agent_version","")
-                    txt.insert("end",
-                        f"  {'Zabbix agent ver':<22}", "key")
-                    txt.insert("end",
-                        f"{av if av else '(не получен)'}\n",
-                        "val" if av else "dim")
-        else:
-            txt.insert("end","  (нет интерфейсов)\n","dim")
-
-        # ── Теги ──────────────────────────────────────────────────────────────
-        section("Tags")
-        tags = h.get("tags",[])
-        if tags:
-            for tg in tags:
-                v = tg.get("value","")
-                txt.insert("end",
-                    f"  • {tg.get('tag','')}",  "key")
-                txt.insert("end",
-                    f"{': '+v if v else ''}\n", "val")
-        else:
-            txt.insert("end","  (нет тегов)\n","dim")
-
-        # ── Макросы ───────────────────────────────────────────────────────────
-        section("Host macros")
-        macros = h.get("macros",[])
-        if macros:
-            MTYPE = {"0":"Text","1":"Secret","2":"Vault"}
-            for m in macros:
-                mtype = MTYPE.get(str(m.get("type","0")),"?")
-                val   = ("***" if str(m.get("type","0"))=="1"
-                         else m.get("value",""))
-                desc  = m.get("description","")
-                txt.insert("end", f"  {m.get('macro',''):<30}","key")
-                txt.insert("end", f"= {val}", "val")
-                if desc:
-                    txt.insert("end", f"  # {desc[:50]}","dim")
-                txt.insert("end","\n")
-        else:
-            txt.insert("end","  (нет макросов)\n","dim")
-
-        txt.configure(state="disabled")
-
     def _filter(self, t, q):
         t.delete(*t.get_children()); q = q.lower()
         for iid, row in t._all:
@@ -6100,8 +6315,21 @@ class App(tk.Tk):
         for i, (_,k) in enumerate(sorted(rows)): t.move(k,"",i)
 
     def _busy(self, on):
-        if on: self._prog.start(12)
-        else:  self._prog.stop()
+        """
+        Счётчик вложенных фоновых операций.
+        Бегунок крутится, пока есть хотя бы одна незавершённая операция,
+        и гарантированно останавливается, когда счётчик доходит до нуля.
+        Это исправляет ситуацию, когда две параллельные загрузки
+        (например, автозагрузка после коннекта + ручное «Загрузить»)
+        сбивали друг другу индикатор.
+        """
+        cnt = getattr(self, "_busy_cnt", 0)
+        cnt = cnt + 1 if on else max(0, cnt - 1)
+        self._busy_cnt = cnt
+        if cnt > 0:
+            self._prog.start(12)
+        else:
+            self._prog.stop()
 
     def _info(self, text): self._lbl_info.configure(text=text)
 
